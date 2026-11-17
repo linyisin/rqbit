@@ -1,3 +1,8 @@
+// Modified by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-17:
+//   - ManagedTorrent::reset_for_recheck(), used by Session::recheck() for qBittorrent's
+//     "Force recheck".
+// Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
+
 pub mod initializing;
 pub mod live;
 pub mod paused;
@@ -466,6 +471,55 @@ impl ManagedTorrent {
             Some(g),
             cancellation_token,
         )
+    }
+
+    /// qbt-rs: prepare a forced recheck (qBittorrent's "Force recheck").
+    ///
+    /// Stops the torrent if it is live, throws away the current in-memory state (including the
+    /// chunk tracker) and puts it back into `Initializing` with the stored have-bitfield marked
+    /// for clearing, so the next `start()` re-hashes everything on disk. Returns whether the
+    /// user intended the torrent to be paused, so the caller can restore that afterwards.
+    pub(crate) fn reset_for_recheck(&self) -> anyhow::Result<bool> {
+        let mut g = self.locked.write();
+        let was_paused = g.paused;
+        match &g.state {
+            ManagedTorrentState::Initializing(_) => bail!("torrent is already being checked"),
+            ManagedTorrentState::None => bail!("bug: torrent is in empty state"),
+            ManagedTorrentState::Live(live) => {
+                // Stop all peers and tasks; the resulting paused state is dropped below.
+                let _paused = live.pause()?;
+            }
+            ManagedTorrentState::Paused(_) | ManagedTorrentState::Error(_) => {}
+        }
+        let metadata = self
+            .metadata
+            .load_full()
+            .context("cannot recheck a torrent without metadata")?;
+        // Drop the old state first so its files are closed before the storage is reopened.
+        drop(g.state.take());
+        let storage = match self
+            .shared
+            .storage_factory
+            .create_and_init(self.shared(), &metadata)
+        {
+            Ok(storage) => storage,
+            Err(e) => {
+                g.state = ManagedTorrentState::Error(anyhow::anyhow!("{e:#}"));
+                self.state_change_notify.notify_waiters();
+                return Err(e);
+            }
+        };
+        let initializing = Arc::new(TorrentStateInitializing::new(
+            self.shared.clone(),
+            metadata,
+            g.only_files.clone(),
+            storage,
+            // "previously errored" makes `check()` clear the stored bitfield and do a full hash check.
+            true,
+        ));
+        g.state = ManagedTorrentState::Initializing(initializing);
+        self.state_change_notify.notify_waiters();
+        Ok(was_paused)
     }
 
     pub fn is_paused(&self) -> bool {

@@ -1,6 +1,7 @@
 // Modified by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-17:
 //   - add_torrent: allocate torrent ids atomically when session persistence is enabled, so
 //     concurrent adds no longer collide (see the "qbt-rs modification" comment below).
+//   - recheck(): force a full recheck of a torrent's data (qBittorrent's "Force recheck").
 // Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
 
 use std::{
@@ -1635,6 +1636,22 @@ impl Session {
     pub async fn unpause(self: &Arc<Self>, handle: &ManagedTorrentHandle) -> anyhow::Result<()> {
         let peer_rx = self.make_peer_rx_managed_torrent(handle, true);
         handle.start(peer_rx, false)?;
+        self.try_update_persistence_metadata(handle).await;
+        Ok(())
+    }
+
+    /// qbt-rs: force a full recheck of the data on disk (qBittorrent's "Force recheck").
+    ///
+    /// The torrent goes back to `initializing` and re-hashes every piece, ignoring the stored
+    /// fastresume bitfield. A running torrent resumes afterwards; a paused one stays paused.
+    pub async fn recheck(self: &Arc<Self>, handle: &ManagedTorrentHandle) -> anyhow::Result<()> {
+        let paused = handle.reset_for_recheck()?;
+        let peer_rx = if paused {
+            None
+        } else {
+            self.make_peer_rx_managed_torrent(handle, true)
+        };
+        handle.start(peer_rx, paused)?;
         self.try_update_persistence_metadata(handle).await;
         Ok(())
     }
