@@ -2,6 +2,7 @@
 //   - add_torrent: allocate torrent ids atomically when session persistence is enabled, so
 //     concurrent adds no longer collide (see the "qbt-rs modification" comment below).
 //   - recheck(): force a full recheck of a torrent's data (qBittorrent's "Force recheck").
+//   - update_file_priorities(): per-file download priorities.
 // Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
 
 use std::{
@@ -1403,6 +1404,7 @@ impl Session {
                     paused: opts.paused,
                     state: ManagedTorrentState::Initializing(initializing),
                     only_files,
+                    file_priorities: None,
                 }),
                 state_change_notify: Notify::new(),
                 shared: minfo,
@@ -1654,6 +1656,15 @@ impl Session {
         handle.start(peer_rx, paused)?;
         self.try_update_persistence_metadata(handle).await;
         Ok(())
+    }
+
+    /// qbt-rs: set per-file download priorities (see `ManagedTorrent::set_file_priorities`).
+    pub async fn update_file_priorities(
+        &self,
+        handle: &ManagedTorrentHandle,
+        priorities: Option<Vec<u8>>,
+    ) -> anyhow::Result<()> {
+        handle.set_file_priorities(priorities)
     }
 
     pub async fn update_only_files(

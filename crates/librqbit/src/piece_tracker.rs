@@ -1,3 +1,7 @@
+// Modified by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-17:
+//   - test_acquire_follows_file_priorities (test only).
+// Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
+
 //! Coordinates piece download state by wrapping ChunkTracker with inflight piece tracking.
 //!
 //! This module provides the [`PieceTracker`] type which encapsulates the relationship between
@@ -371,6 +375,53 @@ mod tests {
 
     fn make_default_file_priorities(file_infos: &FileInfos) -> FilePriorities {
         (0..file_infos.len()).collect()
+    }
+
+    // qbt-rs: pieces are handed out file by file in the configured priority order.
+    #[test]
+    fn test_acquire_follows_file_priorities() {
+        let piece_length = 16384u32;
+        let lengths = Lengths::new(piece_length as u64 * 6, piece_length).unwrap();
+        let bf_len = lengths.piece_bitfield_bytes();
+        let have = BF::from_boxed_slice(vec![0u8; bf_len].into_boxed_slice());
+        let mut selected = BF::from_boxed_slice(vec![0u8; bf_len].into_boxed_slice());
+        for i in 0..6 {
+            selected.set(i, true);
+        }
+        // Three files, two pieces each: a.dat = 0..2, b.dat = 2..4, c.dat = 4..6.
+        let file_infos: FileInfos = ["a.dat", "b.dat", "c.dat"]
+            .iter()
+            .zip(0u32..)
+            .map(|(name, i)| crate::file_info::FileInfo {
+                relative_filename: (*name).into(),
+                offset_in_torrent: u64::from(piece_length) * 2 * u64::from(i),
+                len: u64::from(piece_length) * 2,
+                piece_range: i * 2..i * 2 + 2,
+                attrs: Default::default(),
+            })
+            .collect();
+        let chunks = ChunkTracker::new(have.into_dyn(), selected, lengths, &file_infos).unwrap();
+        let mut tracker = PieceTracker::new(chunks);
+        // a = normal, b = maximum, c = high -> b first, then c, then a.
+        let file_priorities =
+            crate::file_info::file_download_order(&file_infos, Some(&[1, 7, 6]));
+
+        let mut got = Vec::new();
+        for _ in 0..6 {
+            match tracker.acquire_piece(AcquireRequest {
+                peer: peer(1),
+                peer_avg_time: None,
+                priority_pieces: std::iter::empty(),
+                file_priorities: &file_priorities,
+                file_infos: &file_infos,
+                peer_has_piece: |_| true,
+                can_steal: |_| false,
+            }) {
+                AcquireResult::Reserved(piece) => got.push(piece.get()),
+                other => panic!("expected Reserved, got {other:?}"),
+            }
+        }
+        assert_eq!(got, vec![2, 3, 4, 5, 0, 1]);
     }
 
     #[test]

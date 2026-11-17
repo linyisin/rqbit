@@ -1,6 +1,7 @@
 // Modified by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-17:
 //   - ManagedTorrent::reset_for_recheck(), used by Session::recheck() for qBittorrent's
 //     "Force recheck".
+//   - ManagedTorrent::set_file_priorities() / file_priorities(): per-file download priorities.
 // Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
 
 pub mod initializing;
@@ -109,6 +110,9 @@ pub(crate) struct ManagedTorrentLocked {
     // This should change only on "unpause".
     pub(crate) paused: bool,
     pub(crate) state: ManagedTorrentState,
+    /// qbt-rs: per-file download priorities (index = file index; higher downloads first).
+    /// `None` = all equal. Kept here so they survive pause/unpause (the live state is recreated).
+    pub(crate) file_priorities: Option<Vec<u8>>,
     pub(crate) only_files: Option<Vec<usize>>,
 }
 
@@ -424,6 +428,9 @@ impl ManagedTorrent {
                     let paused = g.state.take().assert_paused();
                     let (tx, rx) = tokio::sync::oneshot::channel();
                     let live = TorrentStateLive::new(paused, tx, token.clone())?;
+                    if g.file_priorities.is_some() {
+                        live.set_file_priorities(g.file_priorities.as_deref());
+                    }
                     g.state = ManagedTorrentState::Live(live.clone());
                     t.state_change_notify.notify_waiters();
 
@@ -524,6 +531,31 @@ impl ManagedTorrent {
 
     pub fn is_paused(&self) -> bool {
         self.locked.read().paused
+    }
+
+    /// qbt-rs: set per-file download priorities (index = file index, higher = downloaded
+    /// earlier, equal priorities keep the filename order). Applied immediately if live and
+    /// re-applied every time the torrent goes live again. Whether a file is downloaded at all
+    /// is still controlled by `only_files`. Not persisted by the session; callers that need
+    /// them across restarts should store them and set them again.
+    pub fn set_file_priorities(&self, priorities: Option<Vec<u8>>) -> anyhow::Result<()> {
+        if let (Some(p), Some(metadata)) = (&priorities, &*self.metadata.load()) {
+            let files = metadata.file_infos.len();
+            if p.len() != files {
+                bail!("expected {files} file priorities, got {}", p.len());
+            }
+        }
+        let mut g = self.locked.write();
+        g.file_priorities = priorities;
+        if let ManagedTorrentState::Live(live) = &g.state {
+            live.set_file_priorities(g.file_priorities.as_deref());
+        }
+        Ok(())
+    }
+
+    /// qbt-rs: per-file download priorities set with `set_file_priorities`.
+    pub fn file_priorities(&self) -> Option<Vec<u8>> {
+        self.locked.read().file_priorities.clone()
     }
 
     /// Pause the torrent if it's live.

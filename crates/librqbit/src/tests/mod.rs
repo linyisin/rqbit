@@ -1,6 +1,7 @@
 mod e2e;
 mod e2e_another_local_client;
 mod e2e_padded_files;
+mod e2e_file_priority;
 mod e2e_recheck;
 mod e2e_stream;
 pub mod test_util;

@@ -1,3 +1,8 @@
+// Modified by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-17:
+//   - file download order comes from file_info::file_download_order() and can be changed while
+//     live (set_file_priorities), instead of being fixed to "sorted by filename".
+// Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
+
 // The main logic of rqbit is here - connecting to peers, reading and writing messages
 // to them, tracking peer state etc.
 //
@@ -243,19 +248,9 @@ impl TorrentStateLive {
         let have_bytes = paused.chunk_tracker.get_hns().have_bytes;
         let lengths = *paused.chunk_tracker.get_lengths();
 
-        // TODO: make it configurable
-        let file_priorities = {
-            let mut pri = (0..paused.metadata.file_infos.len()).collect::<Vec<usize>>();
-            // sort by filename, cause many torrents have random sort order.
-            pri.sort_unstable_by_key(|id| {
-                paused
-                    .metadata
-                    .file_infos
-                    .get(*id)
-                    .map(|fi| fi.relative_filename.as_path())
-            });
-            pri
-        };
+        // qbt-rs: configurable through ManagedTorrent::set_file_priorities(); this is the default
+        // order (by filename), the caller re-applies stored priorities right after creation.
+        let file_priorities = crate::file_info::file_download_order(&paused.metadata.file_infos, None);
 
         let (have_broadcast_tx, _) = tokio::sync::broadcast::channel(128);
 
@@ -807,6 +802,19 @@ impl TorrentStateLive {
             warn!(id=self.shared.id, info_hash=?self.shared.info_hash, "there's nowhere to send fatal error, receiver is dead");
         }
         Err(res)
+    }
+
+    /// qbt-rs: re-sort the order in which files are downloaded (see `file_download_order`).
+    /// Pieces already in flight are not affected; the next pieces requested follow the new order.
+    pub(crate) fn set_file_priorities(&self, priorities: Option<&[u8]>) {
+        let order = crate::file_info::file_download_order(&self.metadata.file_infos, priorities);
+        self.lock_write("set_file_priorities").file_priorities = order;
+    }
+
+    /// qbt-rs: the current file download order (file indices). Used by tests.
+    #[cfg(test)]
+    pub(crate) fn file_download_order(&self) -> Vec<usize> {
+        self.lock_read("file_download_order").file_priorities.clone()
     }
 
     pub(crate) fn update_only_files(&self, only_files: &HashSet<usize>) -> anyhow::Result<()> {
