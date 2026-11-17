@@ -1,3 +1,7 @@
+// Modified by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-17:
+//   - read the output folder through its lock (it can change with Session::move_storage).
+// Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
+
 use std::{
     fs::OpenOptions,
     io::IoSlice,
@@ -28,7 +32,7 @@ impl StorageFactory for FilesystemStorageFactory {
         _metadata: &TorrentMetadata,
     ) -> anyhow::Result<FilesystemStorage> {
         Ok(FilesystemStorage {
-            output_folder: shared.options.output_folder.clone(),
+            output_folder: shared.options.output_folder.read().clone(),
             opened_files: Default::default(),
         })
     }

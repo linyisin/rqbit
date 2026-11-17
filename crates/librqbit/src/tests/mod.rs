@@ -1,5 +1,6 @@
 mod e2e;
 mod e2e_another_local_client;
+mod e2e_move_storage;
 mod e2e_padded_files;
 mod e2e_file_priority;
 mod e2e_recheck;

@@ -1,3 +1,8 @@
+// Modified by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-17:
+//   - read the output folder through ManagedTorrent::output_folder() (it can change with
+//     Session::move_storage).
+// Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
+
 use std::{collections::HashSet, marker::PhantomData, net::SocketAddr, str::FromStr, sync::Arc};
 
 use anyhow::Context;
@@ -217,11 +222,7 @@ impl Api {
                         id: Some(id),
                         info_hash: mgr.shared().info_hash.as_string(),
                         name: mgr.name(),
-                        output_folder: mgr
-                            .shared()
-                            .options
-                            .output_folder
-                            .to_string_lossy()
+                        output_folder: mgr.output_folder().to_string_lossy()
                             .into_owned(),
                         total_pieces,
 
@@ -243,11 +244,7 @@ impl Api {
         let handle = self.mgr_handle(idx)?;
         let info_hash = handle.shared().info_hash;
         let only_files = handle.only_files();
-        let output_folder = handle
-            .shared()
-            .options
-            .output_folder
-            .to_string_lossy()
+        let output_folder = handle.output_folder().to_string_lossy()
             .into_owned()
             .to_string();
         make_torrent_details(
@@ -392,11 +389,7 @@ impl Api {
                     handle.metadata.load().as_ref().map(|r| &r.info),
                     handle.name().as_deref(),
                     handle.only_files().as_deref(),
-                    handle
-                        .shared()
-                        .options
-                        .output_folder
-                        .to_string_lossy()
+                    handle.output_folder().to_string_lossy()
                         .into_owned(),
                 )
                 .context("error making torrent details")?;
@@ -404,11 +397,7 @@ impl Api {
                     id: Some(id),
                     details,
                     seen_peers: None,
-                    output_folder: handle
-                        .shared()
-                        .options
-                        .output_folder
-                        .to_string_lossy()
+                    output_folder: handle.output_folder().to_string_lossy()
                         .into_owned(),
                 }
             }
@@ -440,11 +429,7 @@ impl Api {
                     handle.metadata.load().as_ref().map(|r| &r.info),
                     handle.name().as_deref(),
                     handle.only_files().as_deref(),
-                    handle
-                        .shared()
-                        .options
-                        .output_folder
-                        .to_string_lossy()
+                    handle.output_folder().to_string_lossy()
                         .into_owned(),
                 )
                 .context("error making torrent details")?;
@@ -452,11 +437,7 @@ impl Api {
                     id: Some(id),
                     details,
                     seen_peers: None,
-                    output_folder: handle
-                        .shared()
-                        .options
-                        .output_folder
-                        .to_string_lossy()
+                    output_folder: handle.output_folder().to_string_lossy()
                         .into_owned(),
                 }
             }

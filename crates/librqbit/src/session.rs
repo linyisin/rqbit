@@ -3,6 +3,8 @@
 //     concurrent adds no longer collide (see the "qbt-rs modification" comment below).
 //   - recheck(): force a full recheck of a torrent's data (qBittorrent's "Force recheck").
 //   - update_file_priorities(): per-file download priorities.
+//   - move_storage() and AddTorrentOptions::save_path; default_subfolder_for_torrent() moved to
+//     a free function so torrents can compute their save path.
 // Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
 
 use std::{
@@ -305,6 +307,12 @@ pub struct AddTorrentOptions {
 
     // Custom trackers
     pub trackers: Option<Vec<String>>,
+
+    /// qbt-rs: like qBittorrent's "save path": the folder under which the torrent's content is
+    /// placed, still getting the default per-torrent subfolder for multi-file torrents (unlike
+    /// `output_folder`, which is used as-is). Can't be combined with `output_folder`.
+    #[serde(default)]
+    pub save_path: Option<String>,
 }
 
 pub struct ListOnlyResponse {
@@ -1197,42 +1205,7 @@ impl Session {
         info: &ValidatedTorrentMetaV1Info<ByteBufOwned>,
         magnet_name: Option<&str>,
     ) -> anyhow::Result<Option<PathBuf>> {
-        let files = info
-            .iter_file_details()
-            .map(|fd| Ok((fd.filename.to_pathbuf(), fd.len)))
-            .collect::<anyhow::Result<Vec<(PathBuf, u64)>>>()?;
-        if files.len() < 2 {
-            return Ok(None);
-        }
-
-        fn check_valid(pb: &Path) -> anyhow::Result<()> {
-            if pb.components().any(|x| !matches!(x, Component::Normal(_))) {
-                bail!("path traversal in torrent name detected")
-            }
-            Ok(())
-        }
-
-        if let Some(name) = info.name()
-            && !name.is_empty()
-        {
-            let pb = PathBuf::from(name.as_ref());
-            check_valid(&pb)?;
-            return Ok(Some(pb));
-        };
-        if let Some(name) = magnet_name {
-            let pb = PathBuf::from(name);
-            check_valid(&pb)?;
-            return Ok(Some(pb));
-        }
-        // Let the subfolder name be the longest filename
-        let longest = files
-            .iter()
-            .max_by_key(|(_, l)| l)
-            .unwrap()
-            .0
-            .file_stem()
-            .context("can't determine longest filename")?;
-        Ok::<_, anyhow::Error>(Some(PathBuf::from(longest)))
+        default_subfolder_for_torrent(info, magnet_name)
     }
 
     async fn add_torrent_internal(
@@ -1303,8 +1276,16 @@ impl Session {
             opts.list_only,
         )?;
 
+        if opts.save_path.is_some() && opts.output_folder.is_some() {
+            bail!("you can't provide both output_folder and save_path")
+        }
+        let save_root = opts
+            .save_path
+            .as_ref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.output_folder.clone());
         let output_folder = match (opts.output_folder, opts.sub_folder) {
-            (None, None) => self.output_folder.join(
+            (None, None) => save_root.join(
                 self.get_default_subfolder_for_torrent(&metadata.info, name.as_deref())?
                     .unwrap_or_default(),
             ),
@@ -1312,7 +1293,7 @@ impl Session {
             (Some(_), Some(_)) => {
                 bail!("you can't provide both output_folder and sub_folder")
             }
-            (None, Some(s)) => self.output_folder.join(s),
+            (None, Some(s)) => save_root.join(s),
         };
 
         if opts.list_only {
@@ -1378,7 +1359,7 @@ impl Session {
                     peer_read_write_timeout: peer_opts.read_write_timeout,
                     peer_max_request_window: peer_opts.max_request_window,
                     allow_overwrite: opts.overwrite,
-                    output_folder,
+                    output_folder: RwLock::new(output_folder),
                     ratelimits: opts.ratelimits,
                     initial_peers: opts.initial_peers.clone().unwrap_or_default(),
                     peer_limit: opts.peer_limit.or(self.peer_limit),
@@ -1409,6 +1390,7 @@ impl Session {
                 state_change_notify: Notify::new(),
                 shared: minfo,
                 metadata: ArcSwapOption::new(Some(metadata.clone())),
+                moving: Default::default(),
             });
 
             g.add_torrent(handle.clone(), id);
@@ -1517,13 +1499,13 @@ impl Session {
             (Ok(storage), true) => {
                 debug!("will delete files");
                 remove_files_and_dirs(&metadata.file_infos, &storage);
-                if removed.shared().options.output_folder != self.output_folder
+                if removed.output_folder() != self.output_folder
                     && let Err(e) = storage.remove_directory_if_empty(Path::new(""))
                 {
                     warn!(
                         ?id,
                         "error removing {:?}: {e:#}",
-                        removed.shared().options.output_folder
+                        removed.output_folder()
                     )
                 }
             }
@@ -1658,6 +1640,72 @@ impl Session {
         Ok(())
     }
 
+    /// qbt-rs: move a torrent's files to a new save path (qBittorrent's "Set location").
+    ///
+    /// Multi-file torrents keep their content folder (the new output folder is
+    /// `new_save_path/<subfolder>`). The torrent is stopped, files are moved (copy+delete across
+    /// filesystems; nothing is overwritten; on failure everything already moved is moved back),
+    /// then it is re-initialized from the fastresume data at the new location and restored to
+    /// its previous running/paused state. `ManagedTorrent::is_moving()` is true meanwhile.
+    pub async fn move_storage(
+        self: &Arc<Self>,
+        handle: &ManagedTorrentHandle,
+        new_save_path: PathBuf,
+    ) -> anyhow::Result<()> {
+        let metadata = handle
+            .metadata
+            .load_full()
+            .context("cannot move a torrent without metadata")?;
+        let subfolder =
+            default_subfolder_for_torrent(&metadata.info, handle.shared.magnet_name.as_deref())?;
+        let old_folder = handle.output_folder();
+        let new_folder = match &subfolder {
+            Some(sub) => new_save_path.join(sub),
+            None => new_save_path,
+        };
+        if new_folder == old_folder {
+            return Ok(());
+        }
+        if handle.moving.swap(true, Ordering::SeqCst) {
+            bail!("torrent storage is already being moved");
+        }
+        struct ClearMoving<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for ClearMoving<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        let clear_moving = ClearMoving(&handle.moving);
+
+        let was_paused = handle.stop_for_move()?;
+        let files: Vec<PathBuf> = metadata
+            .file_infos
+            .iter()
+            .filter(|f| !f.attrs.padding)
+            .map(|f| f.relative_filename.clone())
+            .collect();
+        let (from, to) = (old_folder.clone(), new_folder.clone());
+        let remove_root = subfolder.is_some();
+        let moved = tokio::task::spawn_blocking(move || move_files(&from, &to, &files, remove_root))
+            .await
+            .context("file move task panicked")
+            .and_then(|r| r);
+        if moved.is_ok() {
+            handle.set_output_folder(new_folder);
+        }
+        let restored = handle.restore_after_move();
+        drop(clear_moving);
+        restored?;
+        let peer_rx = if was_paused {
+            None
+        } else {
+            self.make_peer_rx_managed_torrent(handle, true)
+        };
+        handle.start(peer_rx, was_paused)?;
+        self.try_update_persistence_metadata(handle).await;
+        moved
+    }
+
     /// qbt-rs: set per-file download priorities (see `ManagedTorrent::set_file_priorities`).
     pub async fn update_file_priorities(
         &self,
@@ -1779,6 +1827,115 @@ pub(crate) struct ResolveMagnetResult {
     pub metadata: TorrentMetadata,
     pub peer_rx: PeerStream,
     pub seen_peers: Vec<SocketAddr>,
+}
+
+/// The subfolder a torrent gets under its save path: none for single-file torrents, otherwise
+/// the torrent name (or magnet name, or longest file stem).
+///
+/// qbt-rs: moved out of `Session` so that ManagedTorrent::save_path() and
+/// Session::move_storage() can use it too. Behaviour unchanged.
+pub(crate) fn default_subfolder_for_torrent(
+    info: &ValidatedTorrentMetaV1Info<ByteBufOwned>,
+    magnet_name: Option<&str>,
+) -> anyhow::Result<Option<PathBuf>> {
+    let files = info
+        .iter_file_details()
+        .map(|fd| Ok((fd.filename.to_pathbuf(), fd.len)))
+        .collect::<anyhow::Result<Vec<(PathBuf, u64)>>>()?;
+    if files.len() < 2 {
+        return Ok(None);
+    }
+
+    fn check_valid(pb: &Path) -> anyhow::Result<()> {
+        if pb.components().any(|x| !matches!(x, Component::Normal(_))) {
+            bail!("path traversal in torrent name detected")
+        }
+        Ok(())
+    }
+
+    if let Some(name) = info.name()
+        && !name.is_empty()
+    {
+        let pb = PathBuf::from(name.as_ref());
+        check_valid(&pb)?;
+        return Ok(Some(pb));
+    };
+    if let Some(name) = magnet_name {
+        let pb = PathBuf::from(name);
+        check_valid(&pb)?;
+        return Ok(Some(pb));
+    }
+    // Let the subfolder name be the longest filename
+    let longest = files
+        .iter()
+        .max_by_key(|(_, l)| l)
+        .unwrap()
+        .0
+        .file_stem()
+        .context("can't determine longest filename")?;
+    Ok::<_, anyhow::Error>(Some(PathBuf::from(longest)))
+}
+
+/// qbt-rs: move the given files from `from` to `to` (both are output folders, `files` are paths
+/// relative to them). Refuses to overwrite anything, falls back to copy+delete across
+/// filesystems, rolls back what it already moved if something fails, and removes the
+/// directories left empty under `from` (and `from` itself when `remove_root`).
+fn move_files(from: &Path, to: &Path, files: &[PathBuf], remove_root: bool) -> anyhow::Result<()> {
+    for rel in files {
+        let dst = to.join(rel);
+        if dst.exists() {
+            bail!("destination file already exists: {dst:?}");
+        }
+    }
+
+    fn move_one(src: &Path, dst: &Path) -> std::io::Result<()> {
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        match std::fs::rename(src, dst) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+                std::fs::copy(src, dst)?;
+                std::fs::remove_file(src)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for rel in files {
+        let (src, dst) = (from.join(rel), to.join(rel));
+        // Files that were never created (nothing downloaded yet, or deselected) are skipped.
+        if !src.exists() {
+            continue;
+        }
+        if let Err(e) = move_one(&src, &dst) {
+            for (src, dst) in moved.iter().rev() {
+                if let Err(e) = move_one(dst, src) {
+                    warn!(?src, ?dst, error=?e, "could not move file back after a failed move");
+                }
+            }
+            return Err(e).with_context(|| format!("error moving {src:?} to {dst:?}"));
+        }
+        moved.push((src, dst));
+    }
+
+    // Remove directories left empty under the old folder, deepest first.
+    let mut dirs: Vec<PathBuf> = files
+        .iter()
+        .flat_map(|rel| rel.ancestors().skip(1).filter(|p| *p != Path::new("")).map(|p| from.join(p)))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    dirs.sort_unstable_by_key(|p| std::cmp::Reverse(p.as_os_str().len()));
+    if remove_root {
+        dirs.push(from.to_owned());
+    }
+    for dir in dirs {
+        // Only empty directories; anything the user put there stays.
+        let _ = std::fs::remove_dir(&dir);
+    }
+    Ok(())
 }
 
 fn remove_files_and_dirs(infos: &FileInfos, files: &dyn TorrentStorage) {

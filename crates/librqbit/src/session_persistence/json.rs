@@ -1,3 +1,7 @@
+// Modified by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-17:
+//   - persist the current output folder (it can change with Session::move_storage).
+// Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
+
 use std::{any::TypeId, collections::HashMap, path::PathBuf};
 
 use crate::{
@@ -147,7 +151,7 @@ impl JsonSessionPersistenceStore {
             torrent_bytes: Default::default(),
             only_files: torrent.only_files().clone(),
             is_paused: torrent.is_paused(),
-            output_folder: torrent.shared().options.output_folder.clone(),
+            output_folder: torrent.output_folder(),
         };
 
         let torrent_bytes = torrent

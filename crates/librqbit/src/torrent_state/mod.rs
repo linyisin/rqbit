@@ -2,6 +2,8 @@
 //   - ManagedTorrent::reset_for_recheck(), used by Session::recheck() for qBittorrent's
 //     "Force recheck".
 //   - ManagedTorrent::set_file_priorities() / file_priorities(): per-file download priorities.
+//   - output folder can change (Session::move_storage); save_path(), is_moving(),
+//     stop_for_move(), restore_after_move().
 // Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
 
 pub mod initializing;
@@ -123,7 +125,8 @@ pub(crate) struct ManagedTorrentOptions {
     pub peer_read_write_timeout: Option<Duration>,
     pub peer_max_request_window: Option<usize>,
     pub allow_overwrite: bool,
-    pub output_folder: PathBuf,
+    /// qbt-rs: behind a lock so that Session::move_storage() can change it.
+    pub output_folder: RwLock<PathBuf>,
     pub ratelimits: LimitsConfig,
     pub initial_peers: Vec<SocketAddr>,
     pub peer_limit: Option<usize>,
@@ -219,6 +222,8 @@ pub struct ManagedTorrent {
     pub metadata: ArcSwapOption<TorrentMetadata>,
     pub(crate) state_change_notify: Notify,
     pub(crate) locked: RwLock<ManagedTorrentLocked>,
+    /// qbt-rs: set while Session::move_storage() is moving the files.
+    pub(crate) moving: std::sync::atomic::AtomicBool,
 }
 
 impl ManagedTorrent {
@@ -242,8 +247,67 @@ impl ManagedTorrent {
     }
 
     /// The resolved on-disk folder this torrent's files are written under.
-    pub fn output_folder(&self) -> &Path {
-        &self.shared.options.output_folder
+    ///
+    /// qbt-rs: returns an owned path because Session::move_storage() can change it.
+    pub fn output_folder(&self) -> PathBuf {
+        self.shared.options.output_folder.read().clone()
+    }
+
+    /// qbt-rs: the "save path" in qBittorrent terms: the output folder without the default
+    /// per-torrent subfolder that multi-file torrents get (see `default_subfolder_for_torrent`).
+    pub fn save_path(&self) -> PathBuf {
+        let output = self.output_folder();
+        let subfolder = self.metadata.load().as_ref().and_then(|m| {
+            crate::session::default_subfolder_for_torrent(&m.info, self.shared.magnet_name.as_deref())
+                .ok()
+                .flatten()
+        });
+        match subfolder {
+            Some(sub) if output.ends_with(&sub) => output
+                .ancestors()
+                .nth(sub.components().count())
+                .map(Path::to_path_buf)
+                .unwrap_or(output),
+            _ => output,
+        }
+    }
+
+    /// qbt-rs: whether Session::move_storage() is currently moving this torrent's files.
+    pub fn is_moving(&self) -> bool {
+        self.moving.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn set_output_folder(&self, folder: PathBuf) {
+        *self.shared.options.output_folder.write() = folder;
+    }
+
+    /// qbt-rs: first half of a storage move. Stops the torrent, drops its state (closing all
+    /// files, which Windows needs before they can be renamed) and leaves it in a placeholder
+    /// error state until `restore_after_move()`. Returns the user's paused intention.
+    pub(crate) fn stop_for_move(&self) -> anyhow::Result<bool> {
+        let mut g = self.locked.write();
+        let was_paused = g.paused;
+        match &g.state {
+            ManagedTorrentState::Initializing(_) => {
+                bail!("the torrent is being checked, wait until it finishes")
+            }
+            ManagedTorrentState::None => bail!("bug: torrent is in empty state"),
+            ManagedTorrentState::Live(live) => {
+                let _paused = live.pause()?;
+            }
+            ManagedTorrentState::Paused(_) | ManagedTorrentState::Error(_) => {}
+        }
+        drop(g.state.take());
+        g.state = ManagedTorrentState::Error(anyhow::anyhow!("torrent storage is being moved"));
+        self.state_change_notify.notify_waiters();
+        Ok(was_paused)
+    }
+
+    /// qbt-rs: second half of a storage move: reopen storage at the (possibly new) output
+    /// folder and go back to `Initializing`, keeping the fastresume bitfield (its pieces are
+    /// spot-checked, no full recheck). The caller then calls `start()`.
+    pub(crate) fn restore_after_move(&self) -> anyhow::Result<()> {
+        self.reset_to_initializing(false).map(|_| ())
     }
 
     pub fn with_metadata<R>(
@@ -461,6 +525,9 @@ impl ManagedTorrent {
             }
         }
 
+        if self.is_moving() {
+            bail!("torrent storage is being moved");
+        }
         let session = self
             .shared
             .session
@@ -487,6 +554,10 @@ impl ManagedTorrent {
     /// for clearing, so the next `start()` re-hashes everything on disk. Returns whether the
     /// user intended the torrent to be paused, so the caller can restore that afterwards.
     pub(crate) fn reset_for_recheck(&self) -> anyhow::Result<bool> {
+        self.reset_to_initializing(true)
+    }
+
+    fn reset_to_initializing(&self, clear_have: bool) -> anyhow::Result<bool> {
         let mut g = self.locked.write();
         let was_paused = g.paused;
         match &g.state {
@@ -522,7 +593,7 @@ impl ManagedTorrent {
             g.only_files.clone(),
             storage,
             // "previously errored" makes `check()` clear the stored bitfield and do a full hash check.
-            true,
+            clear_have,
         ));
         g.state = ManagedTorrentState::Initializing(initializing);
         self.state_change_notify.notify_waiters();
@@ -560,6 +631,9 @@ impl ManagedTorrent {
 
     /// Pause the torrent if it's live.
     pub(crate) fn pause(&self) -> anyhow::Result<()> {
+        if self.is_moving() {
+            bail!("torrent storage is being moved");
+        }
         let mut g = self.locked.write();
         match &g.state {
             ManagedTorrentState::Live(live) => {
