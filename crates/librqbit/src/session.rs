@@ -1,3 +1,8 @@
+// Modified by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-17:
+//   - add_torrent: allocate torrent ids atomically when session persistence is enabled, so
+//     concurrent adds no longer collide (see the "qbt-rs modification" comment below).
+// Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
+
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
@@ -1328,7 +1333,13 @@ impl Session {
         let id = if let Some(id) = opts.preferred_id {
             id
         } else if let Some(p) = self.persistence.as_ref() {
-            p.next_id().await?
+            // qbt-rs modification: `p.next_id()` is "largest persisted id + 1", so two adds running
+            // concurrently (before the first one is persisted) used to get the same id, and the
+            // second one was wrongly reported as `AlreadyManaged` because of the `*eid == id` check
+            // below. Allocate from the atomic counter instead, never going below the persisted value.
+            let persisted_next = p.next_id().await?;
+            self.next_id.fetch_max(persisted_next, Ordering::Relaxed);
+            self.next_id.fetch_add(1, Ordering::Relaxed)
         } else {
             self.next_id
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
