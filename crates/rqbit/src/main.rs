@@ -1,3 +1,7 @@
+// Modified by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-18:
+//   - ConnectionOptions gained an `encryption` field; fill it with `..Default::default()`.
+// Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
+
 use std::{
     collections::HashSet,
     io,
@@ -655,6 +659,7 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
                 read_write_timeout: Some(opts.peer_read_write_timeout),
                 ..Default::default()
             }),
+            ..Default::default()
         }),
         bind_device_name: opts.bind_device_name.take(),
         default_storage_factory: Some({

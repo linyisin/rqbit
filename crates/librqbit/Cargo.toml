@@ -41,6 +41,8 @@ _disable_disk_write_net_benchmark = []
 _disable_reconnect_test = []
 
 [dependencies]
+# qbt-rs: 768-bit Diffie-Hellman for MSE/PE (src/mse.rs).
+num-bigint = "0.4"
 # sqlx and home are pinned so that we can compile on older Rusts
 sqlx = { workspace = true, features = ["runtime-tokio", "macros", "postgres"], optional = true }
 home = { workspace = true, optional = true }

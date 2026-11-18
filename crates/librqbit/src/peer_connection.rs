@@ -1,3 +1,7 @@
+// Modified by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-18:
+//   - outgoing connections: encrypted (MSE/PE) handshake per ConnectionOptions::encryption.
+// Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
+
 use std::{
     net::SocketAddr,
     sync::Arc,
@@ -224,12 +228,8 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             .unwrap_or_else(|| Duration::from_secs(10));
 
         let now = Instant::now();
-        let (ckind, mut read, mut write) = with_timeout(
-            "connecting",
-            connect_timeout,
-            self.connector.connect(self.addr),
-        )
-        .await?;
+        let (ckind, mut read, mut write) =
+            self.connect_maybe_encrypted(connect_timeout, rwtimeout).await?;
 
         async move {
             self.handler.on_connected(now.elapsed());
@@ -277,6 +277,59 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         }
         .instrument(trace_span!("", kind=%ckind))
         .await
+    }
+
+    /// qbt-rs: connect, then do the encrypted (MSE/PE) handshake if the policy asks for it.
+    /// With `Enabled`, a failed encrypted handshake is retried in plaintext on a new connection
+    /// (like libtorrent's pe_enabled); with `Required` it is an error.
+    async fn connect_maybe_encrypted(
+        &self,
+        connect_timeout: Duration,
+        rwtimeout: Duration,
+    ) -> Result<(ConnectionKind, BoxAsyncReadVectored, BoxAsyncWrite)> {
+        use crate::mse::{EncryptionPolicy, MseReader, MseWriter};
+        use crate::vectored_traits::AsyncReadVectoredIntoCompat;
+
+        let policy = self.connector.encryption();
+        let (ckind, mut read, mut write) = with_timeout(
+            "connecting",
+            connect_timeout,
+            self.connector.connect(self.addr),
+        )
+        .await?;
+        if policy == EncryptionPolicy::Disabled {
+            return Ok((ckind, read, write));
+        }
+        let result = timeout(
+            rwtimeout,
+            crate::mse::initiate(&mut read, &mut write, self.info_hash, policy),
+        )
+        .await
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("timeout during encrypted handshake")));
+        match result {
+            Ok(established) => {
+                trace!(selected = established.selected, "encrypted handshake done");
+                let read: BoxAsyncReadVectored = Box::new(
+                    MseReader::new(read, established.prefix, established.read_cipher)
+                        .into_vectored_compat(),
+                );
+                let write: BoxAsyncWrite = Box::new(MseWriter::new(write, established.write_cipher));
+                Ok((ckind, read, write))
+            }
+            Err(e) if policy == EncryptionPolicy::Required => {
+                Err(Error::Anyhow(e.context("encrypted handshake failed")))
+            }
+            Err(e) => {
+                debug!("encrypted handshake failed, retrying in plaintext: {e:#}");
+                drop((read, write));
+                with_timeout(
+                    "connecting",
+                    connect_timeout,
+                    self.connector.connect(self.addr),
+                )
+                .await
+            }
+        }
     }
 
     async fn manage_peer(&self, args: ManagePeerArgs) -> Result<()> {

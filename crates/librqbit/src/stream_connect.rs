@@ -1,3 +1,7 @@
+// Modified by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-18:
+//   - ConnectionOptions::encryption / StreamConnector::encryption() (MSE/PE policy).
+// Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
+
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::{Context, bail};
@@ -39,6 +43,8 @@ pub struct ConnectionOptions {
     // TCP outgoing connections are enabled by default
     pub enable_tcp: bool,
     pub peer_opts: Option<PeerConnectionOptions>,
+    /// qbt-rs: protocol encryption (MSE/PE) for outgoing and incoming connections.
+    pub encryption: crate::mse::EncryptionPolicy,
 }
 
 impl Default for ConnectionOptions {
@@ -47,6 +53,7 @@ impl Default for ConnectionOptions {
             enable_tcp: true,
             proxy_url: None,
             peer_opts: None,
+            encryption: Default::default(),
         }
     }
 }
@@ -65,6 +72,7 @@ pub(crate) struct StreamConnectorArgs {
     pub utp_socket: Option<Arc<UtpSocketUdp>>,
     pub bind_device: Option<BindDevice>,
     pub ipv4_only: bool,
+    pub encryption: crate::mse::EncryptionPolicy,
 }
 
 impl SocksProxyConfig {
@@ -135,6 +143,7 @@ pub(crate) struct StreamConnector {
     utp_socket: Option<Arc<librqbit_utp::UtpSocketUdp>>,
     stats: ConnectStatsAtomic,
     ipv4_only: bool,
+    encryption: crate::mse::EncryptionPolicy,
 }
 
 impl StreamConnector {
@@ -160,7 +169,13 @@ impl StreamConnector {
             bind_device: config.bind_device,
             stats: Default::default(),
             ipv4_only: config.ipv4_only,
+            encryption: config.encryption,
         })
+    }
+
+    /// qbt-rs: the protocol encryption policy (applies to outgoing and incoming connections).
+    pub fn encryption(&self) -> crate::mse::EncryptionPolicy {
+        self.encryption
     }
 
     fn get_stat(&self, kind: ConnectionKind, is_v6: bool) -> &SingleStatAtomic {

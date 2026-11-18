@@ -3,6 +3,7 @@
 //     concurrent adds no longer collide (see the "qbt-rs modification" comment below).
 //   - recheck(): force a full recheck of a torrent's data (qBittorrent's "Force recheck").
 //   - update_file_priorities(): per-file download priorities.
+//   - incoming connections: detect and answer encrypted (MSE/PE) handshakes.
 //   - per-torrent tracker statuses passed to TrackerComms (ManagedTorrent::tracker_statuses()).
 //   - move_storage() and AddTorrentOptions::save_path; default_subfolder_for_torrent() moved to
 //     a free function so torrents can compute their save path.
@@ -49,6 +50,7 @@ use crate::{
         TorrentMetadata, TorrentStateLive, initializing::TorrentStateInitializing,
     },
     type_aliases::{BoxAsyncReadVectored, BoxAsyncWrite, PeerStream},
+    vectored_traits::AsyncReadVectoredIntoCompat,
 };
 use anyhow::{Context, bail};
 use arc_swap::ArcSwapOption;
@@ -754,6 +756,7 @@ impl Session {
                     utp_socket: listen_result.as_ref().and_then(|l| l.utp_socket.clone()),
                     bind_device: bind_device.clone(),
                     ipv4_only: opts.ipv4_only,
+                    encryption: opts.connect.as_ref().map(|c| c.encryption).unwrap_or_default(),
                 })
                 .await
                 .context("error creating stream connector")?,
@@ -951,6 +954,48 @@ impl Session {
                 .fetch_add(1, Ordering::Relaxed);
             bail!("Incoming ip {incoming_ip} is not in allowlist");
         }
+
+        // qbt-rs: a plaintext handshake starts with "\x13BitTorrent protocol"; anything else is an
+        // encrypted (MSE/PE) handshake. Either way the bytes read here are put back in front.
+        let policy = self.connector.encryption();
+        let mut first = [0u8; 20];
+        tokio::time::timeout(rwtimeout, tokio::io::AsyncReadExt::read_exact(&mut reader, &mut first))
+            .await
+            .context("timeout reading handshake")?
+            .context("error reading handshake")?;
+        let (mut reader, writer): (BoxAsyncReadVectored, BoxAsyncWrite) =
+            if &first == crate::mse::BT_HANDSHAKE_PREFIX {
+                if policy == crate::mse::EncryptionPolicy::Required {
+                    bail!("plaintext connection refused: encryption is required");
+                }
+                let reader = crate::mse::MseReader::new(reader, first.to_vec(), None);
+                (Box::new(reader.into_vectored_compat()), writer)
+            } else {
+                if policy == crate::mse::EncryptionPolicy::Disabled {
+                    bail!("not a BitTorrent handshake (protocol encryption is disabled)");
+                }
+                let candidates: Vec<([u8; 20], Id20)> = self
+                    .db
+                    .read()
+                    .torrents
+                    .values()
+                    .map(|t| (crate::mse::req2_hash(&t.info_hash()), t.info_hash()))
+                    .collect();
+                let mut writer = writer;
+                let established = tokio::time::timeout(
+                    rwtimeout,
+                    crate::mse::respond(&mut reader, &mut writer, &first, policy, |h| {
+                        candidates.iter().find(|(r, _)| r == h).map(|(_, ih)| *ih)
+                    }),
+                )
+                .await
+                .context("timeout during encrypted handshake")??;
+                trace!(?addr, selected = established.selected, "encrypted handshake done");
+                let reader =
+                    crate::mse::MseReader::new(reader, established.prefix, established.read_cipher);
+                let writer = crate::mse::MseWriter::new(writer, established.write_cipher);
+                (Box::new(reader.into_vectored_compat()), Box::new(writer))
+            };
 
         let mut read_buf = ReadBuf::new();
         let h = read_buf

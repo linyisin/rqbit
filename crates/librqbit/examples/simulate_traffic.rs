@@ -1,3 +1,7 @@
+// Modified by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-18:
+//   - ConnectionOptions gained an `encryption` field; fill it with `..Default::default()`.
+// Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
+
 use std::{
     io::Write,
     net::Ipv6Addr,
@@ -188,6 +192,7 @@ impl TestHarness {
                         keep_alive_interval: None,
                         ..Default::default()
                     }),
+                    ..Default::default()
                 }),
                 ..Default::default()
             },
@@ -277,6 +282,7 @@ impl TestHarness {
                         keep_alive_interval: None,
                         ..Default::default()
                     }),
+                    ..Default::default()
                 }),
                 ..Default::default()
             },

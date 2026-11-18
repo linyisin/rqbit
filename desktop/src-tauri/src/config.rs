@@ -1,3 +1,7 @@
+// Modified by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-18:
+//   - ConnectionOptions gained an `encryption` field; fill it with `..Default::default()`.
+// Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
+
 use std::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     path::{Path, PathBuf},
@@ -72,6 +76,7 @@ impl RqbitDesktopConfigConnections {
                 read_write_timeout: Some(self.peer_read_write_timeout),
                 ..Default::default()
             }),
+            ..Default::default()
         };
         (listener_opts, connect_opts)
     }
