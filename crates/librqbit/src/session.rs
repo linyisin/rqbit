@@ -3,6 +3,7 @@
 //     concurrent adds no longer collide (see the "qbt-rs modification" comment below).
 //   - recheck(): force a full recheck of a torrent's data (qBittorrent's "Force recheck").
 //   - update_file_priorities(): per-file download priorities.
+//   - per-torrent tracker statuses passed to TrackerComms (ManagedTorrent::tracker_statuses()).
 //   - move_storage() and AddTorrentOptions::save_path; default_subfolder_for_torrent() moved to
 //     a free function so torrents can compute their save path.
 // Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
@@ -79,7 +80,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{Instrument, debug, debug_span, error, info, trace, warn};
-use tracker_comms::{TrackerComms, UdpTrackerClient};
+use tracker_comms::{TrackerComms, TrackerStatuses, UdpTrackerClient};
 
 pub const SUPPORTED_SCHEMES: [&str; 3] = ["http:", "https:", "magnet:"];
 
@@ -1221,6 +1222,8 @@ impl Session {
         } = add_res;
 
         let private = metadata.as_ref().is_some_and(|m| m.info.info().private);
+        // qbt-rs: created before the torrent so the first announces are recorded too.
+        let tracker_statuses = TrackerStatuses::default();
 
         let make_peer_rx = || {
             self.make_peer_rx(
@@ -1230,6 +1233,7 @@ impl Session {
                 opts.force_tracker_interval,
                 opts.initial_peers.clone().unwrap_or_default(),
                 private,
+                tracker_statuses.clone(),
             )
         };
 
@@ -1350,6 +1354,7 @@ impl Session {
                 span,
                 info_hash,
                 trackers: trackers.into_iter().collect(),
+                tracker_statuses: tracker_statuses.clone(),
                 spawner: self.spawner.clone(),
                 peer_id: self.peer_id,
                 storage_factory,
@@ -1531,10 +1536,13 @@ impl Session {
             t.shared().options.force_tracker_interval,
             t.shared().options.initial_peers.clone(),
             is_private,
+            t.shared().tracker_statuses.clone(),
         )
     }
 
     // Get a peer stream from both DHT and trackers.
+    // qbt-rs: one more argument (tracker_statuses); same allowance as TrackerComms::start.
+    #[allow(clippy::too_many_arguments)]
     fn make_peer_rx(
         self: &Arc<Self>,
         info_hash: Id20,
@@ -1543,6 +1551,7 @@ impl Session {
         force_tracker_interval: Option<Duration>,
         initial_peers: Vec<SocketAddr>,
         is_private: bool,
+        tracker_statuses: TrackerStatuses,
     ) -> Option<PeerStream> {
         let dht_rx = if is_private {
             None
@@ -1587,6 +1596,7 @@ impl Session {
             self.announce_port().unwrap_or(4240),
             self.reqwest_client.clone(),
             self.udp_tracker_client.clone(),
+            tracker_statuses,
         );
 
         let initial_peers_rx = if initial_peers.is_empty() {

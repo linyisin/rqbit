@@ -5,4 +5,5 @@ mod e2e_padded_files;
 mod e2e_file_priority;
 mod e2e_recheck;
 mod e2e_stream;
+mod e2e_tracker_status;
 pub mod test_util;

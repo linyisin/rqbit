@@ -1,3 +1,8 @@
+// Modified by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-17:
+//   - record per-tracker status (TrackerStatuses) around every announce, and scrape (HTTP BEP 48,
+//     UDP BEP 15) after a successful announce at most every 30 minutes.
+// Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
+
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::net::SocketAddrV4;
@@ -24,6 +29,9 @@ use url::Url;
 use crate::tracker_comms_http;
 use crate::tracker_comms_udp;
 use crate::tracker_comms_udp::UdpTrackerClient;
+use crate::tracker_status::{
+    SCRAPE_INTERVAL, TrackerStatusState, TrackerStatuses, http_scrape_url, parse_http_scrape,
+};
 use librqbit_core::hash_id::Id20;
 
 pub struct TrackerComms {
@@ -36,6 +44,41 @@ pub struct TrackerComms {
     announce_port: u16,
     reqwest_client: reqwest::Client,
     key: u32,
+    /// qbt-rs: per-tracker status, shared with whoever started us.
+    statuses: TrackerStatuses,
+}
+
+/// qbt-rs: an HTTP tracker answered with "failure reason".
+#[derive(Debug)]
+struct HttpTrackerFailure(String);
+
+impl std::fmt::Display for HttpTrackerFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "tracker returned failure. Failure reason: {}", self.0)
+    }
+}
+
+impl std::error::Error for HttpTrackerFailure {}
+
+/// qbt-rs: whether an announce error came from the tracker itself or from not reaching it.
+fn error_state(e: &anyhow::Error) -> TrackerStatusState {
+    if e.downcast_ref::<HttpTrackerFailure>().is_some()
+        || e.downcast_ref::<tracker_comms_udp::TrackerReplyError>().is_some()
+    {
+        TrackerStatusState::TrackerError
+    } else {
+        TrackerStatusState::NotWorking
+    }
+}
+
+fn error_message(e: &anyhow::Error) -> String {
+    if let Some(f) = e.downcast_ref::<HttpTrackerFailure>() {
+        return f.0.clone();
+    }
+    if let Some(f) = e.downcast_ref::<tracker_comms_udp::TrackerReplyError>() {
+        return f.0.clone();
+    }
+    format!("{e:#}")
 }
 
 #[derive(Default)]
@@ -149,7 +192,12 @@ impl TrackerComms {
         announce_port: u16,
         reqwest_client: reqwest::Client,
         udp_client: UdpTrackerClient,
+        // qbt-rs: filled in with each tracker's status as announces/scrapes happen.
+        statuses: TrackerStatuses,
     ) -> Option<BoxStream<'static, SocketAddr>> {
+        for t in &trackers {
+            statuses.register(t);
+        }
         let trackers = trackers
             .into_iter()
             .filter_map(|t| match t.scheme() {
@@ -181,6 +229,7 @@ impl TrackerComms {
                 announce_port,
                 reqwest_client,
                 key: rand::random(),
+                statuses,
             });
             let mut futures = FuturesUnordered::new();
             for tracker in trackers {
@@ -249,18 +298,44 @@ impl TrackerComms {
                         .with_min_delay(Duration::from_secs(10))
                         .with_max_delay(Duration::from_secs(600)),
                 )
-                .notify(|err, retry_in| debug!(?retry_in, "error calling tracker: {err:#}"))
+                .notify(|err, retry_in| {
+                    debug!(?retry_in, "error calling tracker: {err:#}");
+                    self.statuses.update(&tracker_url, |s| {
+                        s.next_announce = Some(std::time::Instant::now() + retry_in)
+                    });
+                })
                 .await
                 .context("this shouldn't fail")?;
 
             event = None;
             let interval = self.force_tracker_interval.unwrap_or(interval);
+            self.statuses.update(&tracker_url, |s| {
+                s.next_announce = Some(std::time::Instant::now() + interval)
+            });
+            self.maybe_scrape_http(&tracker_url).await;
             debug!("sleeping for {:?} after calling tracker", interval);
             tokio::time::sleep(interval).await;
         }
     }
 
     async fn tracker_one_request_http(
+        &self,
+        tracker_url: &Url,
+        event: Option<tracker_comms_http::TrackerRequestEvent>,
+    ) -> anyhow::Result<Duration> {
+        self.statuses
+            .update(tracker_url, |s| s.state = TrackerStatusState::Updating);
+        let result = self.tracker_one_request_http_inner(tracker_url, event).await;
+        if let Err(e) = &result {
+            self.statuses.update(tracker_url, |s| {
+                s.state = error_state(e);
+                s.message = Some(error_message(e));
+            });
+        }
+        result
+    }
+
+    async fn tracker_one_request_http_inner(
         &self,
         tracker_url: &Url,
         event: Option<tracker_comms_http::TrackerRequestEvent>,
@@ -298,10 +373,7 @@ impl TrackerComms {
         if let Ok((error, _)) =
             bencode::from_bytes_with_rest::<tracker_comms_http::TrackerError>(&bytes)
         {
-            anyhow::bail!(
-                "tracker returned failure. Failure reason: {}",
-                error.failure_reason
-            )
+            return Err(HttpTrackerFailure(error.failure_reason.to_string()).into());
         };
         let response = bencode::from_bytes_with_rest::<tracker_comms_http::TrackerResponse>(&bytes)
             .map_err(|e| {
@@ -310,12 +382,65 @@ impl TrackerComms {
             })?
             .0;
 
-        for peer in response.iter_peers() {
+        let peers: Vec<SocketAddr> = response.iter_peers().collect();
+        self.statuses.update(tracker_url, |s| {
+            s.state = TrackerStatusState::Working;
+            s.message = response
+                .warning_message
+                .as_ref()
+                .map(|m| String::from_utf8_lossy(m.as_ref()).into_owned());
+            s.seeders = u32::try_from(response.complete).ok();
+            s.leechers = u32::try_from(response.incomplete).ok();
+            s.peers = u32::try_from(peers.len()).ok();
+            s.min_interval = response.min_interval.map(Duration::from_secs);
+        });
+        for peer in peers {
             self.tx.send(peer).await?;
         }
         Ok(Duration::from_secs(
             response.min_interval.unwrap_or(response.interval),
         ))
+    }
+
+    /// qbt-rs: scrape (BEP 48) at most every SCRAPE_INTERVAL, for the "times downloaded" count.
+    async fn maybe_scrape_http(&self, tracker_url: &Url) {
+        let due = self
+            .statuses
+            .get(tracker_url)
+            .and_then(|s| s.last_scrape)
+            .is_none_or(|t| t.elapsed() >= SCRAPE_INTERVAL);
+        let Some(scrape_url) = http_scrape_url(tracker_url).filter(|_| due) else {
+            return;
+        };
+        self.statuses.update(tracker_url, |s| {
+            s.last_scrape = Some(std::time::Instant::now())
+        });
+        let mut url = scrape_url;
+        let mut query = format!(
+            "info_hash={}",
+            urlencoding::encode_binary(&self.info_hash.0)
+        );
+        if let Some(q) = url.query() {
+            query.push('&');
+            query.push_str(q);
+        }
+        url.set_query(Some(&query));
+        let result: anyhow::Result<crate::ScrapeCounts> = async {
+            let response = self.reqwest_client.get(url).send().await?;
+            if !response.status().is_success() {
+                bail!("scrape responded with {:?}", response.status());
+            }
+            parse_http_scrape(&response.bytes().await?, &self.info_hash)
+        }
+        .await;
+        match result {
+            Ok(c) => self.statuses.update(tracker_url, |s| {
+                s.seeders = Some(c.seeders);
+                s.leechers = Some(c.leechers);
+                s.downloaded = Some(c.downloaded);
+            }),
+            Err(e) => debug!("scrape failed: {e:#}"),
+        }
     }
 
     async fn task_single_tracker_monitor_udp(
@@ -357,15 +482,20 @@ impl TrackerComms {
             .context("this shouldn't happen: failed resolving tracker addrs")?;
 
             prev_addrs = Some(addrs);
+            self.statuses
+                .update(&url, |s| s.state = TrackerStatusState::Updating);
 
             match addrs {
                 UdpTrackerResolveResult::One(addr) => {
                     match self
-                        .tracker_one_request_udp(addr, &client)
+                        .tracker_one_request_udp(&url, addr, &client)
                         .instrument(trace_span!("udp request", ?addr))
                         .await
                     {
-                        Ok(sleep) => sleep_interval = Some(sleep),
+                        Ok(sleep) => {
+                            sleep_interval = Some(sleep);
+                            self.maybe_scrape_udp(&url, addr, &client).await;
+                        }
                         Err(_) => {
                             sleep_interval = Some(sleep_interval.unwrap_or(Duration::from_secs(60)))
                         }
@@ -373,24 +503,60 @@ impl TrackerComms {
                 }
                 UdpTrackerResolveResult::Two(v4, v6) => {
                     let (r4, r6) = tokio::join!(
-                        self.tracker_one_request_udp(v4.into(), &client)
+                        self.tracker_one_request_udp(&url, v4.into(), &client)
                             .instrument(trace_span!("udp request", addr=?v4)),
-                        self.tracker_one_request_udp(v6.into(), &client)
+                        self.tracker_one_request_udp(&url, v6.into(), &client)
                             .instrument(trace_span!("udp request", addr=?v6))
                     );
+                    let worked = match (&r4, &r6) {
+                        (Ok(_), _) => Some(SocketAddr::from(v4)),
+                        (_, Ok(_)) => Some(SocketAddr::from(v6)),
+                        _ => None,
+                    };
                     sleep_interval = Some(
                         r4.or(r6)
                             .ok()
                             .or(sleep_interval)
                             .unwrap_or(Duration::from_secs(60)),
-                    )
+                    );
+                    if let Some(addr) = worked {
+                        self.maybe_scrape_udp(&url, addr, &client).await;
+                    }
                 }
             }
+            if let Some(i) = sleep_interval {
+                self.statuses.update(&url, |s| {
+                    s.next_announce = Some(std::time::Instant::now() + i)
+                });
+            }
+        }
+    }
+
+    /// qbt-rs: UDP scrape (BEP 15) at most every SCRAPE_INTERVAL.
+    async fn maybe_scrape_udp(&self, url: &Url, addr: SocketAddr, client: &UdpTrackerClient) {
+        let due = self
+            .statuses
+            .get(url)
+            .and_then(|s| s.last_scrape)
+            .is_none_or(|t| t.elapsed() >= SCRAPE_INTERVAL);
+        if !due {
+            return;
+        }
+        self.statuses
+            .update(url, |s| s.last_scrape = Some(std::time::Instant::now()));
+        match client.scrape(addr, self.info_hash).await {
+            Ok(c) => self.statuses.update(url, |s| {
+                s.seeders = Some(c.seeders);
+                s.leechers = Some(c.leechers);
+                s.downloaded = Some(c.downloaded);
+            }),
+            Err(e) => debug!(?addr, "scrape failed: {e:#}"),
         }
     }
 
     async fn tracker_one_request_udp(
         &self,
+        url: &Url,
         addr: SocketAddr,
         client: &UdpTrackerClient,
     ) -> anyhow::Result<Duration> {
@@ -422,6 +588,14 @@ impl TrackerComms {
         match client.announce(addr, request).await {
             Ok(response) => {
                 trace!(len = response.addrs.len(), "received announce response");
+                self.statuses.update(url, |s| {
+                    s.state = TrackerStatusState::Working;
+                    s.message = None;
+                    s.seeders = Some(response.seeders);
+                    s.leechers = Some(response.leechers);
+                    s.peers = u32::try_from(response.addrs.len()).ok();
+                    s.min_interval = None;
+                });
                 for addr in response.addrs {
                     self.tx.send(addr).await.context("rx closed")?;
                 }
@@ -431,6 +605,10 @@ impl TrackerComms {
             }
             Err(e) => {
                 debug!(?addr, "error reading announce response: {e:#}");
+                self.statuses.update(url, |s| {
+                    s.state = error_state(&e);
+                    s.message = Some(error_message(&e));
+                });
                 Err(e)
             }
         }

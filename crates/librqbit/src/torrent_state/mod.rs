@@ -2,6 +2,7 @@
 //   - ManagedTorrent::reset_for_recheck(), used by Session::recheck() for qBittorrent's
 //     "Force recheck".
 //   - ManagedTorrent::set_file_priorities() / file_priorities(): per-file download priorities.
+//   - tracker_statuses() (per-tracker announce/scrape status).
 //   - output folder can change (Session::move_storage); save_path(), is_moving(),
 //     stop_for_move(), restore_after_move().
 // Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
@@ -194,6 +195,8 @@ impl TorrentMetadata {
 pub struct ManagedTorrentShared {
     pub id: TorrentId,
     pub info_hash: Id20,
+    /// qbt-rs: status of each tracker (announce results, scrape counts).
+    pub tracker_statuses: tracker_comms::TrackerStatuses,
     pub(crate) spawner: BlockingSpawner,
     pub trackers: HashSet<url::Url>,
     pub peer_id: Id20,
@@ -270,6 +273,11 @@ impl ManagedTorrent {
                 .unwrap_or(output),
             _ => output,
         }
+    }
+
+    /// qbt-rs: status of every tracker of this torrent, sorted by URL (qBittorrent's tracker list).
+    pub fn tracker_statuses(&self) -> Vec<(String, tracker_comms::TrackerStatus)> {
+        self.shared.tracker_statuses.snapshot()
     }
 
     /// qbt-rs: whether Session::move_storage() is currently moving this torrent's files.

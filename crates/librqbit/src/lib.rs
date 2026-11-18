@@ -1,3 +1,8 @@
+// Modified by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-17:
+//   - re-export tracker status types; test modules for recheck, file priorities, move storage
+//     and tracker status.
+// Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
+
 //!
 //! This crate provides everything necessary to download [torrents](https://en.wikipedia.org/wiki/BitTorrent).
 //!
@@ -101,6 +106,8 @@ pub use torrent_state::{
     TorrentStatsState,
 };
 pub use type_aliases::FileInfos;
+// qbt-rs: per-tracker status (see ManagedTorrent::tracker_statuses()).
+pub use tracker_comms::{TrackerStatus, TrackerStatusState, TrackerStatuses};
 
 pub use buffers::*;
 pub use clone_to_owned::CloneToOwned;

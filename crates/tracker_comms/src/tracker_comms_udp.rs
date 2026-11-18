@@ -1,3 +1,8 @@
+// Modified by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-17:
+//   - BEP 15 scrape (Request::Scrape, Response::Scrape, UdpTrackerClient::scrape) and a typed
+//     TrackerReplyError for error replies.
+// Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
+
 use std::{
     collections::{HashMap, hash_map::Entry},
     ffi::CStr,
@@ -16,7 +21,7 @@ use tracing::{debug, debug_span, trace, warn};
 
 const ACTION_CONNECT: u32 = 0;
 const ACTION_ANNOUNCE: u32 = 1;
-// const ACTION_SCRAPE: u32 = 2;
+const ACTION_SCRAPE: u32 = 2;
 const ACTION_ERROR: u32 = 3;
 
 pub const EVENT_NONE: u32 = 0;
@@ -49,7 +54,21 @@ pub struct AnnounceFields {
 pub enum Request {
     Connect,
     Announce(ConnectionId, AnnounceFields),
+    /// qbt-rs: BEP 15 scrape for a single info hash.
+    Scrape(ConnectionId, Id20),
 }
+
+/// qbt-rs: the tracker itself answered with an error (as opposed to not answering at all).
+#[derive(Debug)]
+pub struct TrackerReplyError(pub String);
+
+impl std::fmt::Display for TrackerReplyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "tracker returned an error: {}", self.0)
+    }
+}
+
+impl std::error::Error for TrackerReplyError {}
 
 impl Request {
     pub fn serialize(
@@ -95,6 +114,12 @@ impl Request {
                 w.extend_from_slice(&(-1i32).to_be_bytes())?; // num want -1
                 w.extend_from_slice(&fields.port.to_be_bytes())?;
             }
+            Request::Scrape(connection_id, info_hash) => {
+                w.extend_from_slice(&connection_id.to_be_bytes())?;
+                w.extend_from_slice(&ACTION_SCRAPE.to_be_bytes())?;
+                w.extend_from_slice(&transaction_id.to_be_bytes())?;
+                w.extend_from_slice(&info_hash.0)?;
+            }
         }
         Ok(w.offset)
     }
@@ -114,6 +139,8 @@ pub struct AnnounceResponse {
 pub enum Response {
     Connect(ConnectionId),
     Announce(AnnounceResponse),
+    /// qbt-rs: scrape counts.
+    Scrape(crate::ScrapeCounts),
     #[allow(dead_code)]
     Error(String),
     Unknown,
@@ -206,6 +233,17 @@ impl Response {
                     leechers,
                     seeders,
                     addrs,
+                })
+            }
+            ACTION_SCRAPE => {
+                let (seeders, b) = u32::parse_num(buf).context("can't parse seeders")?;
+                let (downloaded, b) = u32::parse_num(b).context("can't parse completed")?;
+                let (leechers, b) = u32::parse_num(b).context("can't parse leechers")?;
+                buf = b;
+                Response::Scrape(crate::ScrapeCounts {
+                    seeders,
+                    downloaded,
+                    leechers,
                 })
             }
             ACTION_ERROR => {
@@ -370,9 +408,7 @@ impl UdpTrackerClient {
             .context("timeout connecting")?
             .context("sender dead")?;
         match &response {
-            Response::Error(e) => {
-                anyhow::bail!("remote errored: {e}")
-            }
+            Response::Error(e) => return Err(TrackerReplyError(e.clone()).into()),
             Response::Unknown => {
                 anyhow::bail!("remote replied with something we could not parse")
             }
@@ -415,6 +451,22 @@ impl UdpTrackerClient {
             other => bail!("unexpected response {other:?}, expected announce"),
         }
     }
+
+    /// qbt-rs: BEP 15 scrape for one info hash.
+    pub async fn scrape(
+        &self,
+        tracker: SocketAddr,
+        info_hash: Id20,
+    ) -> anyhow::Result<crate::ScrapeCounts> {
+        let connection_id = self.get_connection_id(tracker).await?;
+        let response = self
+            .request(tracker, Request::Scrape(connection_id, info_hash))
+            .await?;
+        match response {
+            Response::Scrape(r) => Ok(r),
+            other => bail!("unexpected response {other:?}, expected scrape"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -426,6 +478,35 @@ mod tests {
     use crate::tracker_comms_udp::{
         AnnounceFields, EVENT_NONE, Request, Response, new_transaction_id,
     };
+
+    // qbt-rs: scrape request/response.
+    #[test]
+    fn test_scrape_roundtrip() {
+        let hash = Id20::new([3u8; 20]);
+        let mut buf = [0u8; 64];
+        let len = Request::Scrape(0x1122, hash).serialize(7, &mut buf).unwrap();
+        assert_eq!(len, 8 + 4 + 4 + 20);
+        assert_eq!(&buf[8..12], &2u32.to_be_bytes(), "action 2 = scrape");
+        assert_eq!(&buf[16..36], &hash.0);
+
+        let mut resp = Vec::new();
+        for n in [2u32, 7, 5, 9, 40] {
+            resp.extend_from_slice(&n.to_be_bytes());
+        }
+        let (tid, r) = Response::parse(&resp, false).unwrap();
+        assert_eq!(tid, 7);
+        match r {
+            Response::Scrape(c) => assert_eq!(
+                c,
+                crate::ScrapeCounts {
+                    seeders: 5,
+                    downloaded: 9,
+                    leechers: 40
+                }
+            ),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
 
     #[test]
     fn test_parse_announce() {
