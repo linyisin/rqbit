@@ -1,6 +1,9 @@
 // Modified by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-17:
 //   - mse module (protocol encryption); re-export tracker status types; test modules for recheck, file priorities, move storage
 //     and tracker status.
+//   - 2026-11-20: web_seed module (BEP 19).
+//   - 2026-11-21: BitTorrent v2 (BEP 52): V2_PIECE_LAYERS_MISSING and merkle re-exports, e2e test
+//     module.
 // Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
 
 //!
@@ -105,7 +108,7 @@ pub use session::{
 pub use stream_connect::ConnectionOptions;
 pub use torrent_state::{
     ManagedTorrent, ManagedTorrentShared, ManagedTorrentState, TorrentMetadata, TorrentStats,
-    TorrentStatsState,
+    TorrentStatsState, V2_PIECE_LAYERS_MISSING,
 };
 pub use type_aliases::FileInfos;
 // qbt-rs: per-tracker status (see ManagedTorrent::tracker_statuses()).
@@ -117,6 +120,7 @@ pub use web_seed::{WebSeedStatus, WebSeeds};
 pub use buffers::*;
 pub use clone_to_owned::CloneToOwned;
 pub use librqbit_core::magnet::*;
+pub use librqbit_core::merkle;
 pub use librqbit_core::peer_id::*;
 pub use librqbit_core::torrent_metainfo::*;
 

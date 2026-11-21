@@ -1,3 +1,7 @@
+// Modified by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-21: fills the new BitTorrent
+// v2 fields of the metainfo structs (always empty: created torrents are v1).
+// Licensed under Apache-2.0 like the rest of rqbit.
+
 use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::io::{BufWriter, Read};
@@ -173,6 +177,8 @@ async fn create_torrent_raw<'a>(
             sha1: None,
             symlink_path: None,
             private: false,
+            meta_version: None,
+            file_tree: None,
         },
         output_folder,
     })
@@ -236,6 +242,7 @@ pub async fn create_torrent<'a>(
             publisher_url: None,
             creation_date: None,
             info_hash,
+            info_hash_v2: None,
         },
         output_folder: res.output_folder,
     })

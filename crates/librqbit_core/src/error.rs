@@ -1,3 +1,6 @@
+// Modified by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-21: more BitTorrent v2
+// (BEP 52) validation errors. Licensed under Apache-2.0 like the rest of rqbit.
+
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("expected multi-file torrent to have at least one file")]
@@ -54,4 +57,11 @@ pub enum Error {
     V2InvalidTorrent,
     #[error("v2 hybrid file list mismatch: {0}")]
     V2HybridFileListMismatch(String),
+    // qbt-rs: checks libtorrent also makes (src/torrent_info.cpp, commit 15c6ff3).
+    #[error("v2 file is missing its pieces root, or it is all zeros")]
+    V2MissingPiecesRoot,
+    #[error("v2 files share a pieces root but have different sizes")]
+    V2InconsistentFileRoots,
+    #[error("v2 piece_layers has an entry that matches no file")]
+    V2UnknownPieceLayersEntry,
 }

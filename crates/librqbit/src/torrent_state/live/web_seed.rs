@@ -88,7 +88,7 @@ impl TorrentStateLive {
     fn web_seed_files(&self, base: &url::Url) -> SeedFiles {
         let info = &self.metadata.info;
         let name = info.info().name.as_ref().map(|n| n.as_ref().to_vec());
-        let multi_file = info.info().files.is_some();
+        let multi_file = info.is_multi_file();
         let urls = info
             .iter_file_details()
             .map(|fd| {

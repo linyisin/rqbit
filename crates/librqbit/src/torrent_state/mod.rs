@@ -5,6 +5,8 @@
 //   - tracker_statuses() (per-tracker announce/scrape status).
 //   - output folder can change (Session::move_storage); save_path(), is_moving(),
 //     stop_for_move(), restore_after_move().
+//   - 2026-11-21: TorrentMetadata loads and checks the piece layers of BitTorrent v2-only
+//     torrents (BEP 52) and keeps the v2 info hash.
 // Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
 
 pub mod initializing;
@@ -153,14 +155,28 @@ pub struct TorrentMetadata {
     pub torrent_bytes: Bytes,
     pub info_bytes: Bytes,
     pub file_infos: FileInfos,
+    /// qbt-rs: SHA-256 info hash of a v2 or hybrid torrent (BEP 52).
+    pub info_hash_v2: Option<librqbit_core::Id32>,
 }
 
 impl TorrentMetadata {
     pub(crate) fn new(
-        info: ValidatedTorrentMetaV1Info<ByteBufOwned>,
+        mut info: ValidatedTorrentMetaV1Info<ByteBufOwned>,
         torrent_bytes: Bytes,
         info_bytes: Bytes,
     ) -> anyhow::Result<Self> {
+        // qbt-rs: v2-only pieces are checked against the "piece layers", which are outside
+        // the info dictionary.
+        // Only v2-only torrents can fail here.
+        info.attach_piece_layers(&torrent_bytes)
+            .map_err(|e| anyhow::Error::new(e).context(V2_PIECE_LAYERS_MISSING))?;
+        let info_hash_v2 = (info.info().meta_version == Some(2)).then(|| {
+            use sha1w::ISha256;
+            let mut h = sha1w::Sha256::new();
+            h.update(&info_bytes);
+            librqbit_core::Id32::new(h.finish())
+        });
+
         let file_infos = info
             .iter_file_details_ext()
             .map(|fd| {
@@ -179,6 +195,7 @@ impl TorrentMetadata {
             torrent_bytes,
             info_bytes,
             file_infos,
+            info_hash_v2,
         })
     }
 
@@ -186,6 +203,10 @@ impl TorrentMetadata {
         self.info.lengths()
     }
 }
+
+/// qbt-rs: shown when a v2-only torrent can't be checked because its piece layers are missing
+/// or wrong (e.g. it came from a magnet link: getting them from peers isn't implemented).
+pub const V2_PIECE_LAYERS_MISSING: &str = "BitTorrent v2 torrent without valid piece layers";
 
 /// Common information about torrent shared among all possible states.
 ///

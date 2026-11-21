@@ -1,3 +1,6 @@
+// Modified by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-21: pieces of v2-only
+// torrents (BEP 52) are checked against their merkle subtree (`PieceHasher`) instead of SHA-1.
+
 use std::{
     marker::PhantomData,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
@@ -7,6 +10,7 @@ use anyhow::{Context, bail};
 use buffers::{ByteBuf, ByteBufOwned};
 use librqbit_core::{
     lengths::{ChunkInfo, ValidPieceIndex},
+    merkle::PieceHasherV2,
     torrent_metainfo::ValidatedTorrentMetaV1Info,
 };
 use peer_binary_protocol::{DoubleBufHelper, Piece};
@@ -19,15 +23,35 @@ use crate::{
     type_aliases::{BF, FileInfos, PeerHandle},
 };
 
-pub fn update_hash_from_file<Sha1: ISha1>(
+/// qbt-rs: hashes the data of one piece. v1 and hybrid torrents use SHA-1 over the whole piece
+/// (padding included, as zeros). v2-only torrents hash 16 KiB blocks into a merkle subtree, and
+/// padding isn't part of it (it only ever follows the end of a file, see BEP 52).
+pub enum PieceHasher {
+    V1(Sha1),
+    V2(PieceHasherV2),
+}
+
+impl PieceHasher {
+    fn update(&mut self, data: &[u8]) {
+        match self {
+            PieceHasher::V1(h) => h.update(data),
+            PieceHasher::V2(h) => h.update(data),
+        }
+    }
+}
+
+pub fn update_hash_from_file(
     file_id: usize,
     file_info: &FileInfo,
     mut pos: u64,
     files: &dyn TorrentStorage,
-    hash: &mut Sha1,
+    hash: &mut PieceHasher,
     buf: &mut [u8],
     mut bytes_to_read: usize,
 ) -> anyhow::Result<()> {
+    if file_info.attrs.padding && matches!(hash, PieceHasher::V2(_)) {
+        return Ok(());
+    }
     let mut read = 0;
     while bytes_to_read > 0 {
         let chunk = std::cmp::min(buf.len(), bytes_to_read);
@@ -66,6 +90,22 @@ impl<'a> FileOps<'a> {
             files,
             file_infos,
             phantom_data: PhantomData,
+        }
+    }
+
+    fn piece_hasher(&self) -> PieceHasher {
+        if self.torrent.is_v2_only() {
+            PieceHasher::V2(PieceHasherV2::new())
+        } else {
+            PieceHasher::V1(Sha1::new())
+        }
+    }
+
+    /// `None` if the piece index is out of range (or a v2 torrent has no piece hashes).
+    fn compare_piece_hash(&self, piece: u32, hasher: PieceHasher) -> Option<bool> {
+        match hasher {
+            PieceHasher::V1(h) => self.torrent.info().compare_hash(piece, h.finish()),
+            PieceHasher::V2(h) => self.torrent.v2_hashes()?.check_piece(piece, h),
         }
     }
 
@@ -115,7 +155,7 @@ impl<'a> FileOps<'a> {
             }
 
             piece_files.clear();
-            let mut computed_hash = Sha1::new();
+            let mut computed_hash = self.piece_hasher();
             let mut piece_remaining = piece_info.len as usize;
             let mut some_files_broken = false;
             progress.fetch_add(piece_info.len as u64, Ordering::Relaxed);
@@ -171,9 +211,7 @@ impl<'a> FileOps<'a> {
             }
 
             if self
-                .torrent
-                .info()
-                .compare_hash(piece_info.piece_index.get(), computed_hash.finish())
+                .compare_piece_hash(piece_info.piece_index.get(), computed_hash)
                 .context("bug: either torrent info broken or we have a bug - piece index invalid")?
             {
                 have_pieces.set(piece_info.piece_index.get() as usize, true);
@@ -188,7 +226,7 @@ impl<'a> FileOps<'a> {
             return Ok(true);
         }
 
-        let mut h = Sha1::new();
+        let mut h = self.piece_hasher();
         let piece_length = self.torrent.lengths().piece_length(piece_index);
         let mut absolute_offset = self.torrent.lengths().piece_offset(piece_index);
         let mut buf = vec![0u8; std::cmp::min(65536, piece_length as usize)];
@@ -234,11 +272,7 @@ impl<'a> FileOps<'a> {
             absolute_offset = 0;
         }
 
-        match self
-            .torrent
-            .info()
-            .compare_hash(piece_index.get(), h.finish())
-        {
+        match self.compare_piece_hash(piece_index.get(), h) {
             Some(true) => {
                 trace!("piece={} hash matches", piece_index);
                 Ok(true)

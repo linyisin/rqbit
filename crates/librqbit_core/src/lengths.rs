@@ -1,3 +1,7 @@
+// Modified by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-21: accept the shorter
+// requests for the end of a file in BitTorrent v2-only torrents
+// (`chunk_info_from_received_data_v2`).
+
 use crate::{Error, constants::CHUNK_SIZE};
 
 pub fn last_element_size<T>(total_length: T, piece_length: T) -> T
@@ -217,6 +221,40 @@ impl Lengths {
             absolute_index,
         })
     }
+    /// Like [`Self::chunk_info_from_received_data`], for v2-only torrents (BEP 52), where every
+    /// file starts at a piece boundary. `piece_data_len` is the file data in the piece, without
+    /// the padding before the next file. Peers request only that data, so the block at the end
+    /// of a file can be shorter than [`CHUNK_SIZE`] (libtorrent uses
+    /// `torrent_info::piece_size_for_req`, which is `file_storage::piece_size2` for v2-only
+    /// torrents). Full-size requests that include padding are still accepted, as libtorrent
+    /// does when checking incoming requests against `piece_size`.
+    pub fn chunk_info_from_received_data_v2(
+        &self,
+        piece_index: ValidPieceIndex,
+        begin: u32,
+        chunk_size: u32,
+        piece_data_len: u32,
+    ) -> Option<ChunkInfo> {
+        if let Some(chunk) = self.chunk_info_from_received_data(piece_index, begin, chunk_size) {
+            return Some(chunk);
+        }
+        if piece_data_len > self.piece_length(piece_index)
+            || !begin.is_multiple_of(CHUNK_SIZE)
+            || begin >= piece_data_len
+            || chunk_size != (piece_data_len - begin).min(CHUNK_SIZE)
+        {
+            return None;
+        }
+        let index = begin / CHUNK_SIZE;
+        Some(ChunkInfo {
+            piece_index,
+            chunk_index: index,
+            size: chunk_size,
+            offset: begin,
+            absolute_index: self.chunks_per_piece * piece_index.get() + index,
+        })
+    }
+
     pub const fn chunk_range(&self, index: ValidPieceIndex) -> std::ops::Range<usize> {
         let start = index.0 * self.chunks_per_piece;
         let end = start + self.chunks_per_piece(index);
@@ -303,6 +341,31 @@ mod tests {
 
     fn make_lengths() -> Lengths {
         Lengths::new(1174243328, 262144).unwrap()
+    }
+
+    #[test]
+    fn v2_accepts_short_requests_at_the_end_of_a_file() {
+        // Two pieces of 32 KiB; the first holds a file of 20000 bytes and its padding.
+        let l = Lengths::new(65536, 32768).unwrap();
+        let p0 = l.validate_piece_index(0).unwrap();
+        let data_len = 20000;
+        let ok = |begin, len| l.chunk_info_from_received_data_v2(p0, begin, len, data_len);
+
+        let short = ok(16384, 20000 - 16384).unwrap();
+        assert_eq!((short.chunk_index, short.offset, short.size), (1, 16384, 3616));
+        assert_eq!(short.absolute_index, 1);
+        // The full blocks, padding included, still work.
+        assert_eq!(ok(0, 16384).unwrap().size, 16384);
+        assert_eq!(ok(16384, 16384).unwrap().size, 16384);
+        // Anything else doesn't.
+        assert!(ok(16384, 3000).is_none(), "shorter than the data");
+        assert!(ok(16384, 4000).is_none(), "longer than the data, shorter than a block");
+        assert!(ok(100, 3516).is_none(), "not block aligned");
+        assert!(l.chunk_info_from_received_data_v2(p0, 0, 100, 100).is_some());
+        assert!(
+            l.chunk_info_from_received_data_v2(p0, 0, 100, 40000).is_none(),
+            "data length larger than the piece"
+        );
     }
 
     #[test]

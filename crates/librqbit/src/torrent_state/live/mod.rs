@@ -1,6 +1,10 @@
 // Modified by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-17:
 //   - file download order comes from file_info::file_download_order() and can be changed while
 //     live (set_file_priorities), instead of being fixed to "sorted by filename".
+//   - 2026-11-20: HTTP web seeds (BEP 19, see the `web_seed` submodule); write_to_disk moved to
+//     module level so web seeds can share it.
+//   - 2026-11-21: answers BitTorrent v2 hash requests (BEP 52, on_hash_request), and accepts
+//     the shorter requests v2 peers send for the end of a file (on_download_request).
 // Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
 
 // The main logic of rqbit is here - connecting to peers, reading and writing messages
@@ -1286,6 +1290,12 @@ impl PeerConnectionHandler for &'_ PeerHandler {
                         })?;
                 }
             }
+            // qbt-rs: BitTorrent v2 (BEP 52) hash exchange. We have every piece hash of a
+            // v2-only torrent from its .torrent file, so we answer requests but never send any.
+            Message::HashRequest(request) => self.on_hash_request(request)?,
+            Message::Hashes(_) | Message::HashReject(_) => {
+                trace!("received hashes / hash reject, but we never ask for hashes");
+            }
             Message::Extended(ExtendedMessage::UtPex(pex)) => {
                 if self.state.metadata.info.info().private {
                     warn!(
@@ -1677,11 +1687,27 @@ impl PeerHandler {
             }
         };
 
-        let chunk_info = match self.state.lengths.chunk_info_from_received_data(
-            piece_index,
-            request.begin,
-            request.length,
-        ) {
+        // BitTorrent v2: peers don't request the padding at the end of a file's last piece.
+        let v2_data_len = self
+            .state
+            .metadata
+            .info
+            .v2_hashes()
+            .and_then(|h| h.piece_data_len(piece_index.get()));
+        let chunk_info = match v2_data_len {
+            Some(data_len) => self.state.lengths.chunk_info_from_received_data_v2(
+                piece_index,
+                request.begin,
+                request.length,
+                data_len,
+            ),
+            None => self.state.lengths.chunk_info_from_received_data(
+                piece_index,
+                request.begin,
+                request.length,
+            ),
+        };
+        let chunk_info = match chunk_info {
             Some(d) => d,
             None => {
                 anyhow::bail!(
@@ -2017,6 +2043,39 @@ impl PeerHandler {
             .await
             .with_context(|| format!("error processing received chunk {chunk_info:?}"))?;
 
+        Ok(())
+    }
+
+    /// qbt-rs: answers a BEP 52 hash request from the piece layers we have (layers below the
+    /// piece layer would have to be read from disk; those, and anything invalid, get a "hash
+    /// reject", like libtorrent does).
+    fn on_hash_request(&self, request: peer_binary_protocol::HashRequest) -> anyhow::Result<()> {
+        let hashes = self.state.metadata.info.v2_hashes().and_then(|h| {
+            h.get_hashes(
+                &request.pieces_root,
+                request.base,
+                request.index,
+                request.count,
+                request.proof_layers,
+            )
+        });
+        // The answer has to fit in one message buffer.
+        let max_hashes = (peer_binary_protocol::MAX_MSG_LEN
+            - 5
+            - peer_binary_protocol::HashRequest::LEN)
+            / 32;
+        let reply = match hashes {
+            Some(hashes) if hashes.len() <= max_hashes => {
+                WriterRequest::Hashes(request, hashes.concat().into())
+            }
+            _ => {
+                debug!(?request, "rejecting hash request");
+                WriterRequest::Message(Message::HashReject(request))
+            }
+        };
+        self.tx
+            .send(reply)
+            .context("error answering hash request: channel closed")?;
         Ok(())
     }
 

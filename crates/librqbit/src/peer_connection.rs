@@ -1,5 +1,6 @@
 // Modified by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-18:
 //   - outgoing connections: encrypted (MSE/PE) handshake per ConnectionOptions::encryption.
+//   - 2026-11-21: WriterRequest::Hashes, the answer to a BitTorrent v2 hash request (BEP 52).
 // Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
 
 use std::{
@@ -68,6 +69,8 @@ pub enum WriterRequest {
     UtPex(UtPex<ByteBufOwned>),
     ReadChunkRequest(ChunkInfo),
     Disconnect(anyhow::Result<()>),
+    /// qbt-rs: BEP 52 "hashes" (the concatenated 32-byte hashes).
+    Hashes(peer_binary_protocol::HashRequest, bytes::Bytes),
 }
 
 #[serde_as]
@@ -453,6 +456,14 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                     WriterRequest::UtPex(ut_pex) => {
                         Message::Extended(ExtendedMessage::UtPex(ut_pex.as_borrowed()))
                             .serialize(&mut *write_buf, ext_msg_ids)?
+                    }
+                    WriterRequest::Hashes(request, hashes) => {
+                        Message::Hashes(peer_binary_protocol::Hashes {
+                            request,
+                            hashes_0: ByteBuf(&hashes),
+                            hashes_1: ByteBuf(&[]),
+                        })
+                        .serialize(&mut *write_buf, ext_msg_ids)?
                     }
                     WriterRequest::ReadChunkRequest(chunk) => {
                         #[allow(unused_mut)]

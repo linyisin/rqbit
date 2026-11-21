@@ -98,6 +98,11 @@ impl CloneToOwned for ByteBuf<'_> {
     type Target = ByteBufOwned;
 
     fn clone_to_owned(&self, within_buffer: Option<&Bytes>) -> Self::Target {
+        // qbt-rs (2026-11-21): an empty buffer needs no copy and may come from anywhere (e.g. a
+        // defaulted field such as the "pieces" of a BitTorrent v2-only torrent).
+        if self.0.is_empty() {
+            return ByteBufOwned(Bytes::new());
+        }
         // Try zero-copy from the provided buffer.
         if let Some(within_buffer) = within_buffer {
             let haystack = within_buffer.as_ptr() as usize;

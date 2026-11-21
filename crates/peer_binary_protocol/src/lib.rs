@@ -1,6 +1,10 @@
 // BitTorrent peer protocol implementation: parsing, serialization etc.
 //
 // Can be used outside of librqbit.
+//
+// Modified by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-21: the BitTorrent v2
+// (BEP 52) "hash request" (21), "hashes" (22) and "hash reject" (23) messages. Licensed under
+// Apache-2.0 like the rest of rqbit.
 
 mod double_buf;
 pub mod extended;
@@ -47,6 +51,9 @@ const MSGID_REQUEST: MsgId = 6;
 const MSGID_PIECE: MsgId = 7;
 const MSGID_CANCEL: MsgId = 8;
 const MSGID_EXTENDED: MsgId = 20;
+const MSGID_HASH_REQUEST: MsgId = 21;
+const MSGID_HASHES: MsgId = 22;
+const MSGID_HASH_REJECT: MsgId = 23;
 
 pub const EXTENDED_UT_METADATA_KEY: &[u8] = b"ut_metadata";
 pub const MY_EXTENDED_UT_METADATA: u8 = 3;
@@ -69,6 +76,9 @@ impl MsgIdDebug {
             MSGID_PIECE => "piece",
             MSGID_CANCEL => "cancel",
             MSGID_EXTENDED => "extended",
+            MSGID_HASH_REQUEST => "hash_request",
+            MSGID_HASHES => "hashes",
+            MSGID_HASH_REJECT => "hash_reject",
             _ => return None,
         };
         Some(n)
@@ -216,6 +226,50 @@ impl<'a> Piece<ByteBuf<'a>> {
     }
 }
 
+/// BEP 52: the header shared by "hash request", "hashes" and "hash reject": which nodes of a
+/// file's merkle tree (identified by its pieces root) are asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HashRequest {
+    pub pieces_root: [u8; 32],
+    /// The layer, 0 being the leaves (16 KiB blocks).
+    pub base: u32,
+    pub index: u32,
+    pub count: u32,
+    pub proof_layers: u32,
+}
+
+impl HashRequest {
+    pub const LEN: usize = 32 + INTEGER_LEN * 4;
+
+    fn serialize_unchecked_len(&self, buf: &mut [u8]) -> usize {
+        buf[..32].copy_from_slice(&self.pieces_root);
+        BE::write_u32(&mut buf[32..36], self.base);
+        BE::write_u32(&mut buf[36..40], self.index);
+        BE::write_u32(&mut buf[40..44], self.count);
+        BE::write_u32(&mut buf[44..48], self.proof_layers);
+        Self::LEN
+    }
+
+    fn deserialize(buf: &mut DoubleBufHelper<'_>) -> Option<Self> {
+        let raw = buf.consume::<{ HashRequest::LEN }>().ok()?;
+        Some(HashRequest {
+            pieces_root: raw[..32].try_into().ok()?,
+            base: BE::read_u32(&raw[32..36]),
+            index: BE::read_u32(&raw[36..40]),
+            count: BE::read_u32(&raw[40..44]),
+            proof_layers: BE::read_u32(&raw[44..48]),
+        })
+    }
+}
+
+/// BEP 52 "hashes": the requested nodes followed by the uncle hashes, 32 bytes each.
+#[derive(Debug)]
+pub struct Hashes<'a> {
+    pub request: HashRequest,
+    pub hashes_0: ByteBuf<'a>,
+    pub hashes_1: ByteBuf<'a>,
+}
+
 #[derive(Debug)]
 pub enum Message<'a> {
     Request(Request),
@@ -229,6 +283,9 @@ pub enum Message<'a> {
     NotInterested,
     Piece(Piece<ByteBuf<'a>>),
     Extended(ExtendedMessage<ByteBuf<'a>>),
+    HashRequest(HashRequest),
+    Hashes(Hashes<'a>),
+    HashReject(HashRequest),
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -322,6 +379,29 @@ impl Message<'_> {
                 write_preamble!(INTEGER_LEN as u32, MSGID_HAVE);
                 out[5..9].copy_from_slice(&v.to_be_bytes());
                 Ok(9)
+            }
+            Message::HashRequest(r) | Message::HashReject(r) => {
+                check_len!(PREAMBLE_LEN + HashRequest::LEN);
+                let msg_id = if matches!(self, Message::HashRequest(_)) {
+                    MSGID_HASH_REQUEST
+                } else {
+                    MSGID_HASH_REJECT
+                };
+                write_preamble!(HashRequest::LEN as u32, msg_id);
+                r.serialize_unchecked_len(&mut out[PREAMBLE_LEN..]);
+                Ok(PREAMBLE_LEN + HashRequest::LEN)
+            }
+            Message::Hashes(h) => {
+                let (h0, h1) = (h.hashes_0.as_ref(), h.hashes_1.as_ref());
+                let payload_len = HashRequest::LEN + h0.len() + h1.len();
+                check_len!(PREAMBLE_LEN + payload_len);
+                write_preamble!(payload_len as u32, MSGID_HASHES);
+                let mut pos = PREAMBLE_LEN;
+                pos += h.request.serialize_unchecked_len(&mut out[pos..]);
+                out[pos..pos + h0.len()].copy_from_slice(h0);
+                pos += h0.len();
+                out[pos..pos + h1.len()].copy_from_slice(h1);
+                Ok(PREAMBLE_LEN + payload_len)
             }
             Message::Extended(e) => {
                 check_len!(PREAMBLE_LEN + 2);
@@ -459,6 +539,29 @@ impl Message<'_> {
                 Message::Extended(ExtendedMessage::deserialize(buf.with_max_len(msg_len))?),
                 PREAMBLE_LEN + msg_len,
             )),
+            MSGID_HASH_REQUEST | MSGID_HASH_REJECT => {
+                check_msg_len!(48); // HashRequest::LEN
+                let r = HashRequest::deserialize(&mut buf).unwrap();
+                let msg = if msg_id == MSGID_HASH_REQUEST {
+                    Message::HashRequest(r)
+                } else {
+                    Message::HashReject(r)
+                };
+                Ok((msg, total_len))
+            }
+            MSGID_HASHES => {
+                check_msg_len!(min 48); // HashRequest::LEN
+                let request = HashRequest::deserialize(&mut buf).unwrap();
+                let (hashes_0, hashes_1) = buf.consume_variable(msg_len - HashRequest::LEN).unwrap();
+                Ok((
+                    Message::Hashes(Hashes {
+                        request,
+                        hashes_0: hashes_0.into(),
+                        hashes_1: hashes_1.into(),
+                    }),
+                    total_len,
+                ))
+            }
             msg_id => Err(MessageDeserializeError::UnsupportedMessageId(msg_id)),
         }
     }
