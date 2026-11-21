@@ -67,6 +67,7 @@ pub mod limits;
 mod listen;
 mod merge_streams;
 pub mod mse;
+pub mod web_seed;
 mod peer_connection;
 mod peer_info_reader;
 mod piece_tracker;
@@ -111,6 +112,7 @@ pub use type_aliases::FileInfos;
 pub use tracker_comms::{TrackerStatus, TrackerStatusState, TrackerStatuses};
 // qbt-rs: protocol encryption policy (see mse.rs).
 pub use mse::EncryptionPolicy;
+pub use web_seed::{WebSeedStatus, WebSeeds};
 
 pub use buffers::*;
 pub use clone_to_owned::CloneToOwned;

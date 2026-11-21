@@ -7,4 +7,5 @@ mod e2e_file_priority;
 mod e2e_recheck;
 mod e2e_stream;
 mod e2e_tracker_status;
+mod e2e_web_seed;
 pub mod test_util;

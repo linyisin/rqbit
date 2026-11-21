@@ -199,6 +199,8 @@ pub struct ManagedTorrentShared {
     pub tracker_statuses: tracker_comms::TrackerStatuses,
     pub(crate) spawner: BlockingSpawner,
     pub trackers: HashSet<url::Url>,
+    /// qbt-rs: HTTP web seeds (BEP 19 "url-list") and what they are doing.
+    pub web_seeds: crate::web_seed::WebSeeds,
     pub peer_id: Id20,
     pub span: tracing::Span,
     pub(crate) options: ManagedTorrentOptions,
@@ -278,6 +280,11 @@ impl ManagedTorrent {
     /// qbt-rs: status of every tracker of this torrent, sorted by URL (qBittorrent's tracker list).
     pub fn tracker_statuses(&self) -> Vec<(String, tracker_comms::TrackerStatus)> {
         self.shared.tracker_statuses.snapshot()
+    }
+
+    /// qbt-rs: the torrent's HTTP web seeds (BEP 19) and what they are doing.
+    pub fn web_seeds(&self) -> Vec<crate::web_seed::WebSeedStatus> {
+        self.shared.web_seeds.statuses()
     }
 
     /// qbt-rs: whether Session::move_storage() is currently moving this torrent's files.

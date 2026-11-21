@@ -129,7 +129,7 @@ pub struct Session {
     listen_addr: Option<SocketAddr>,
     dht: Option<Dht>,
     pub(crate) connector: Arc<StreamConnector>,
-    reqwest_client: reqwest::Client,
+    pub(crate) reqwest_client: reqwest::Client,
     udp_tracker_client: UdpTrackerClient,
     disable_trackers: bool,
 
@@ -568,6 +568,8 @@ struct InternalAddResult {
     info_hash: Id20,
     metadata: Option<TorrentMetadata>,
     trackers: Vec<url::Url>,
+    /// qbt-rs: BEP 19 web seeds from the .torrent's "url-list".
+    web_seeds: Vec<url::Url>,
     name: Option<String>,
 }
 
@@ -1186,6 +1188,7 @@ impl Session {
                             .into_iter()
                             .filter_map(|t| url::Url::parse(&t).ok())
                             .collect(),
+                        web_seeds: Vec::new(),
                         metadata: None,
                         name: magnet.name,
                     }
@@ -1224,8 +1227,11 @@ impl Session {
                         trackers.extend(custom_trackers);
                     }
 
+                    let web_seeds =
+                        crate::web_seed::url_list_from_torrent_bytes(&torrent.torrent_bytes);
                     InternalAddResult {
                         info_hash: torrent.meta.info_hash,
+                        web_seeds,
                         metadata: Some(TorrentMetadata::new(
                             torrent.meta.info.data.validate()?,
                             torrent.torrent_bytes,
@@ -1263,6 +1269,7 @@ impl Session {
             info_hash,
             metadata,
             trackers,
+            web_seeds,
             name,
         } = add_res;
 
@@ -1399,6 +1406,7 @@ impl Session {
                 span,
                 info_hash,
                 trackers: trackers.into_iter().collect(),
+                web_seeds: crate::web_seed::WebSeeds::new(web_seeds),
                 tracker_statuses: tracker_statuses.clone(),
                 spawner: self.spawner.clone(),
                 peer_id: self.peer_id,

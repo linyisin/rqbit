@@ -47,6 +47,8 @@
 pub mod peer;
 pub mod peers;
 pub mod stats;
+// qbt-rs: HTTP web seeds (BEP 19).
+mod web_seed;
 
 use std::{
     borrow::Cow,
@@ -341,6 +343,9 @@ impl TorrentStateLive {
             format!("[{}]upload_scheduler", state.shared.id),
             state.clone().task_upload_scheduler(ratelimit_upload_rx),
         );
+
+        // qbt-rs: download from the torrent's web seeds too.
+        state.start_web_seeds();
         Ok(state)
     }
 
@@ -1026,6 +1031,170 @@ impl PeerFlowControl {
             request_window: max_request_window,
         }
     }
+}
+
+/// Writes a received chunk and, when it completes a piece, checks the hash and marks the piece.
+///
+/// qbt-rs: moved out of `PeerHandler::on_received_piece` (unchanged) so web seeds can use it.
+fn write_to_disk(
+    state: &TorrentStateLive,
+    addr: PeerHandle,
+    counters: &AtomicPeerCounters,
+    piece: &Piece<ByteBuf<'_>>,
+    chunk_info: &ChunkInfo,
+) -> anyhow::Result<()> {
+    let index = piece.index;
+
+    // If someone stole the piece by now, ignore it.
+    // However if they didn't, don't let them steal it while we are writing.
+    // So that by the time we are done writing AND if it was the last piece,
+    // we can actually checksum etc.
+    // Otherwise it might get into some weird state.
+    let ppl_guard = {
+        let g = state.lock_read("check_steal");
+
+        let ppl = state
+            .per_piece_locks
+            .get(piece.index as usize)
+            .map(|l| l.read());
+
+        match g.get_pieces()?.get_inflight(chunk_info.piece_index) {
+            Some(inflight) if inflight.peer == addr => {}
+            Some(inflight) => {
+                debug!(
+                    "in-flight piece {} was stolen by {}, ignoring",
+                    chunk_info.piece_index, inflight.peer
+                );
+                return Ok(());
+            }
+            None => {
+                debug!(
+                    "in-flight piece {} not found. it was probably completed by someone else",
+                    chunk_info.piece_index
+                );
+                return Ok(());
+            }
+        };
+
+        ppl
+    };
+
+    // While we hold per piece lock, noone can steal it.
+    // So we can proceed writing knowing that the piece is ours now and will still be by the time
+    // the write is finished.
+    //
+
+    if !cfg!(feature = "_disable_disk_write_net_benchmark") {
+        match state.file_ops().write_chunk(addr, piece, chunk_info) {
+            Ok(()) => {}
+            Err(e) => {
+                error!(
+                    id = state.shared.id,
+                    info_hash = ?state.shared.info_hash,
+                    "FATAL: error writing chunk to disk: {e:#}"
+                );
+                return state.on_fatal_error(e);
+            }
+        };
+    }
+
+    let full_piece_download_time = {
+        let mut g = state.lock_write("mark_chunk_downloaded");
+        let chunk_marking_result = g.get_pieces_mut()?.mark_chunk_downloaded(piece);
+        trace!(?piece, chunk_marking_result=?chunk_marking_result);
+
+        match chunk_marking_result {
+            Some(ChunkMarkingResult::Completed) => {
+                trace!("piece={} done, will write and checksum", piece.index);
+                // Remove from inflight to prevent others from stealing it during hash check.
+                g.get_pieces_mut()?.take_inflight(chunk_info.piece_index)
+            }
+            Some(ChunkMarkingResult::PreviouslyCompleted) => {
+                // TODO: we might need to send cancellations here.
+                debug!("piece={} was done by someone else, ignoring", piece.index);
+                return Ok(());
+            }
+            Some(ChunkMarkingResult::NotCompleted) => None,
+            None => {
+                anyhow::bail!(
+                    "bogus data received: {:?}, cannot map this to a chunk, dropping peer",
+                    piece
+                );
+            }
+        }
+    };
+
+    // We don't care about per piece lock anymore, as it's removed from inflight pieces.
+    // It shouldn't impact perf anyway, but dropping just in case.
+    drop(ppl_guard);
+
+    let full_piece_download_time = match full_piece_download_time {
+        Some(t) => t,
+        None => return Ok(()),
+    };
+
+    match state
+        .file_ops()
+        .check_piece(chunk_info.piece_index)
+        .with_context(|| format!("error checking piece={index}"))?
+    {
+        true => {
+            {
+                let mut g = state.lock_write("mark_piece_downloaded");
+                g.get_pieces_mut()?
+                    .mark_piece_hash_ok(chunk_info.piece_index);
+            }
+
+            // Global piece counters.
+            let piece_len = state.lengths.piece_length(chunk_info.piece_index) as u64;
+            state
+                .stats
+                .downloaded_and_checked_bytes
+                // This counter is used to compute "is_finished", so using
+                // stronger ordering.
+                .fetch_add(piece_len, Ordering::Release);
+            state
+                .stats
+                .downloaded_and_checked_pieces
+                // This counter is used to compute "is_finished", so using
+                // stronger ordering.
+                .fetch_add(1, Ordering::Release);
+            state
+                .stats
+                .have_bytes
+                .fetch_add(piece_len, Ordering::Relaxed);
+            #[allow(clippy::cast_possible_truncation)]
+            state.stats.total_piece_download_ms.fetch_add(
+                full_piece_download_time.as_millis() as u64,
+                Ordering::Relaxed,
+            );
+
+            // Per-peer piece counters.
+            counters.on_piece_completed(piece_len, full_piece_download_time);
+            state.peers.reset_peer_backoff(addr);
+
+            trace!(piece = index, "successfully downloaded and verified");
+
+            state.on_piece_completed(chunk_info.piece_index)?;
+
+            state.transmit_haves(chunk_info.piece_index);
+        }
+        false => {
+            warn!(
+                id = state.shared.id,
+                info_hash = ?state.shared.info_hash,
+                ?addr,
+                "checksum for piece={} did not validate. disconnecting peer.", index
+            );
+            state
+                .lock_write("mark_piece_broken")
+                .get_pieces_mut()?
+                .mark_piece_hash_failed(chunk_info.piece_index);
+            state.new_pieces_notify.notify_waiters();
+            anyhow::bail!("i am probably a bogus peer. dying.")
+        }
+    };
+    Ok(())
 }
 
 // All peer state that would never be used by other actors should pe put here.
@@ -1838,167 +2007,6 @@ impl PeerHandler {
             .counters
             .fetched_bytes
             .fetch_add(piece.len() as u64, Ordering::Relaxed);
-
-        fn write_to_disk(
-            state: &TorrentStateLive,
-            addr: PeerHandle,
-            counters: &AtomicPeerCounters,
-            piece: &Piece<ByteBuf<'_>>,
-            chunk_info: &ChunkInfo,
-        ) -> anyhow::Result<()> {
-            let index = piece.index;
-
-            // If someone stole the piece by now, ignore it.
-            // However if they didn't, don't let them steal it while we are writing.
-            // So that by the time we are done writing AND if it was the last piece,
-            // we can actually checksum etc.
-            // Otherwise it might get into some weird state.
-            let ppl_guard = {
-                let g = state.lock_read("check_steal");
-
-                let ppl = state
-                    .per_piece_locks
-                    .get(piece.index as usize)
-                    .map(|l| l.read());
-
-                match g.get_pieces()?.get_inflight(chunk_info.piece_index) {
-                    Some(inflight) if inflight.peer == addr => {}
-                    Some(inflight) => {
-                        debug!(
-                            "in-flight piece {} was stolen by {}, ignoring",
-                            chunk_info.piece_index, inflight.peer
-                        );
-                        return Ok(());
-                    }
-                    None => {
-                        debug!(
-                            "in-flight piece {} not found. it was probably completed by someone else",
-                            chunk_info.piece_index
-                        );
-                        return Ok(());
-                    }
-                };
-
-                ppl
-            };
-
-            // While we hold per piece lock, noone can steal it.
-            // So we can proceed writing knowing that the piece is ours now and will still be by the time
-            // the write is finished.
-            //
-
-            if !cfg!(feature = "_disable_disk_write_net_benchmark") {
-                match state.file_ops().write_chunk(addr, piece, chunk_info) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        error!(
-                            id = state.shared.id,
-                            info_hash = ?state.shared.info_hash,
-                            "FATAL: error writing chunk to disk: {e:#}"
-                        );
-                        return state.on_fatal_error(e);
-                    }
-                };
-            }
-
-            let full_piece_download_time = {
-                let mut g = state.lock_write("mark_chunk_downloaded");
-                let chunk_marking_result = g.get_pieces_mut()?.mark_chunk_downloaded(piece);
-                trace!(?piece, chunk_marking_result=?chunk_marking_result);
-
-                match chunk_marking_result {
-                    Some(ChunkMarkingResult::Completed) => {
-                        trace!("piece={} done, will write and checksum", piece.index);
-                        // Remove from inflight to prevent others from stealing it during hash check.
-                        g.get_pieces_mut()?.take_inflight(chunk_info.piece_index)
-                    }
-                    Some(ChunkMarkingResult::PreviouslyCompleted) => {
-                        // TODO: we might need to send cancellations here.
-                        debug!("piece={} was done by someone else, ignoring", piece.index);
-                        return Ok(());
-                    }
-                    Some(ChunkMarkingResult::NotCompleted) => None,
-                    None => {
-                        anyhow::bail!(
-                            "bogus data received: {:?}, cannot map this to a chunk, dropping peer",
-                            piece
-                        );
-                    }
-                }
-            };
-
-            // We don't care about per piece lock anymore, as it's removed from inflight pieces.
-            // It shouldn't impact perf anyway, but dropping just in case.
-            drop(ppl_guard);
-
-            let full_piece_download_time = match full_piece_download_time {
-                Some(t) => t,
-                None => return Ok(()),
-            };
-
-            match state
-                .file_ops()
-                .check_piece(chunk_info.piece_index)
-                .with_context(|| format!("error checking piece={index}"))?
-            {
-                true => {
-                    {
-                        let mut g = state.lock_write("mark_piece_downloaded");
-                        g.get_pieces_mut()?
-                            .mark_piece_hash_ok(chunk_info.piece_index);
-                    }
-
-                    // Global piece counters.
-                    let piece_len = state.lengths.piece_length(chunk_info.piece_index) as u64;
-                    state
-                        .stats
-                        .downloaded_and_checked_bytes
-                        // This counter is used to compute "is_finished", so using
-                        // stronger ordering.
-                        .fetch_add(piece_len, Ordering::Release);
-                    state
-                        .stats
-                        .downloaded_and_checked_pieces
-                        // This counter is used to compute "is_finished", so using
-                        // stronger ordering.
-                        .fetch_add(1, Ordering::Release);
-                    state
-                        .stats
-                        .have_bytes
-                        .fetch_add(piece_len, Ordering::Relaxed);
-                    #[allow(clippy::cast_possible_truncation)]
-                    state.stats.total_piece_download_ms.fetch_add(
-                        full_piece_download_time.as_millis() as u64,
-                        Ordering::Relaxed,
-                    );
-
-                    // Per-peer piece counters.
-                    counters.on_piece_completed(piece_len, full_piece_download_time);
-                    state.peers.reset_peer_backoff(addr);
-
-                    trace!(piece = index, "successfully downloaded and verified");
-
-                    state.on_piece_completed(chunk_info.piece_index)?;
-
-                    state.transmit_haves(chunk_info.piece_index);
-                }
-                false => {
-                    warn!(
-                        id = state.shared.id,
-                        info_hash = ?state.shared.info_hash,
-                        ?addr,
-                        "checksum for piece={} did not validate. disconnecting peer.", index
-                    );
-                    state
-                        .lock_write("mark_piece_broken")
-                        .get_pieces_mut()?
-                        .mark_piece_hash_failed(chunk_info.piece_index);
-                    state.new_pieces_notify.notify_waiters();
-                    anyhow::bail!("i am probably a bogus peer. dying.")
-                }
-            };
-            Ok(())
-        }
 
         self.state
             .shared
