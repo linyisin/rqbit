@@ -1,7 +1,8 @@
 // Added by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-22: our external IP address as
 // peers see it (the "yourip" field of BEP 10 extended handshakes), shown in qBittorrent's status
 // bar. Like libtorrent's ip_voter: votes from peers on the local network don't count, and the
-// address with the most votes wins. Licensed under Apache-2.0 like the rest of rqbit.
+// address with the most votes wins. The router's answer to NAT-PMP counts as a vote too.
+// Licensed under Apache-2.0 like the rest of rqbit.
 
 use std::{collections::HashMap, net::IpAddr};
 
@@ -50,6 +51,14 @@ impl ExternalIpVoter {
             votes.remove(&weakest);
         }
         *votes.entry(ours).or_default() += 1;
+    }
+
+    /// qbt-rs: the router (NAT-PMP) told us our public address; it counts as one vote.
+    pub fn vote_router(&self, ours: IpAddr) {
+        if is_local(&ours) {
+            return; // e.g. behind a second NAT
+        }
+        *self.votes.lock().entry(ours).or_default() += 1;
     }
 
     /// The address most peers reported, IPv4 first (that's what qBittorrent shows first).

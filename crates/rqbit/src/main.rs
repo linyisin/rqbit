@@ -1,5 +1,6 @@
 // Modified by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-18:
 //   - ConnectionOptions gained an `encryption` field; fill it with `..Default::default()`.
+//   - 2026-11-22: SessionOptions gained `choke_interval` (default).
 // Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
 
 use std::{
@@ -696,6 +697,7 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
         runtime_worker_threads: Some(opts.max_blocking_threads as usize),
         ipv4_only: opts.ipv4_only,
         client_name_and_version: None,
+        choke_interval: None,
     };
 
     #[allow(clippy::needless_update)]

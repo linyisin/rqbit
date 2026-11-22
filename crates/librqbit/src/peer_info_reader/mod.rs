@@ -284,7 +284,7 @@ impl PeerConnectionHandler for Handler {
         false
     }
 
-    fn serialize_bitfield_message_to_buf(&self, _buf: &mut [u8]) -> anyhow::Result<usize> {
+    fn serialize_bitfield_message_to_buf(&self, _buf: &mut [u8], _fast: bool) -> anyhow::Result<usize> {
         Ok(0)
     }
 
@@ -343,9 +343,9 @@ impl PeerConnectionHandler for Handler {
                 if bytes.len() < h.request.count as usize * 32 {
                     anyhow::bail!("peer sent fewer hashes than requested");
                 }
-                for (i, node) in bytes.chunks_exact(32).take(h.request.count as usize).enumerate() {
+                for (i, node) in bytes.as_chunks::<32>().0.iter().take(h.request.count as usize).enumerate() {
                     if let Some(slot) = file.received.get_mut(h.request.index as usize + i) {
-                        *slot = Some(node.try_into().unwrap());
+                        *slot = Some(*node);
                     }
                 }
                 pending.files.iter().all(|f| f.received.iter().all(Option::is_some))

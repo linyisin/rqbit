@@ -217,6 +217,8 @@ impl TorrentStateLive {
             file_infos: &self.metadata.file_infos,
             peer_has_piece: |_| true,
             can_steal: |_| false,
+            // qbt-rs: web seeds keep the file order (contiguous HTTP ranges), not rarest first.
+            picking: None,
         }) {
             AcquireResult::Reserved(piece) | AcquireResult::Stolen { piece, .. } => {
                 trace!(piece = piece.get(), "web seed reserved piece");

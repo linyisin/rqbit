@@ -1,3 +1,7 @@
+// Modified by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-22: NAT-PMP port forwarding
+// (ListenerOptions::enable_natpmp_port_forwarding).
+// Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
+
 use std::{
     net::{Ipv6Addr, SocketAddr},
     sync::Arc,
@@ -16,6 +20,7 @@ pub(crate) struct ListenResult {
     pub tcp_socket: Option<TcpListener>,
     pub utp_socket: Option<Arc<UtpSocketUdp>>,
     pub enable_upnp_port_forwarding: bool,
+    pub enable_natpmp_port_forwarding: bool,
     pub addr: SocketAddr,
     pub announce_port: Option<u16>,
     pub max_pending_incoming_handshake_checks: usize,
@@ -53,6 +58,9 @@ pub struct ListenerOptions {
     pub mode: ListenerMode,
     pub listen_addr: SocketAddr,
     pub enable_upnp_port_forwarding: bool,
+    /// qbt-rs: map the port with NAT-PMP (RFC 6886) at the default gateway too; qBittorrent's
+    /// port forwarding setting turns on both.
+    pub enable_natpmp_port_forwarding: bool,
     pub utp_opts: Option<librqbit_utp::SocketOpts>,
     pub announce_port: Option<u16>,
     pub ipv4_only: bool,
@@ -66,6 +74,7 @@ impl Default for ListenerOptions {
             mode: ListenerMode::TcpOnly,
             listen_addr: (Ipv6Addr::UNSPECIFIED, 0).into(),
             enable_upnp_port_forwarding: false,
+            enable_natpmp_port_forwarding: false,
             utp_opts: None,
             announce_port: None,
             ipv4_only: false,
@@ -159,6 +168,7 @@ impl ListenerOptions {
             announce_port,
             addr: listen_addr,
             enable_upnp_port_forwarding: self.enable_upnp_port_forwarding,
+            enable_natpmp_port_forwarding: self.enable_natpmp_port_forwarding,
             max_pending_incoming_handshake_checks: self.max_pending_incoming_handshake_checks,
         })
     }

@@ -1,3 +1,7 @@
+// Modified by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-22: `unchoked` counter (peers we
+// unchoke, for the choker's upload slots).
+// Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
+
 use std::sync::atomic::AtomicU32;
 
 use crate::{
@@ -17,6 +21,7 @@ gen_stats!(AggregatePeerStatsAtomic AggregatePeerStats, [
     live_utp u32,
     live_socks u32,
     live_seeders u32,
+    unchoked u32,
     seen u32,
     dead u32,
     not_needed u32,
@@ -48,6 +53,9 @@ impl AggregatePeerStatsAtomic {
             if l.seeder {
                 atomic_inc(&self.live_seeders);
             }
+            if l.am_unchoked {
+                atomic_inc(&self.unchoked);
+            }
         }
         atomic_inc(self.counter(state));
     }
@@ -58,6 +66,9 @@ impl AggregatePeerStatsAtomic {
             if l.seeder {
                 atomic_dec(&self.live_seeders);
             }
+            if l.am_unchoked {
+                atomic_dec(&self.unchoked);
+            }
         }
         atomic_dec(self.counter(state));
     }
@@ -67,6 +78,15 @@ impl AggregatePeerStatsAtomic {
             atomic_inc(&self.live_seeders);
         } else {
             atomic_dec(&self.live_seeders);
+        }
+    }
+
+    /// qbt-rs: a live peer was choked or unchoked by us.
+    pub(crate) fn unchoked_changed(&self, unchoked: bool) {
+        if unchoked {
+            atomic_inc(&self.unchoked);
+        } else {
+            atomic_dec(&self.unchoked);
         }
     }
 

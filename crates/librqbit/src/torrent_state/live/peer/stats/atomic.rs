@@ -43,6 +43,10 @@ pub(crate) mod conn_flags {
     pub const RC4: u32 = 8;
     /// Only the handshake was encrypted (MSE/PE with plaintext selected).
     pub const PLAINTEXT_ENCRYPTED: u32 = 16;
+    /// We unchoke the peer (crate::choker).
+    pub const LOCAL_UNCHOKED: u32 = 32;
+    /// ... in an optimistic slot.
+    pub const OPTIMISTIC: u32 = 64;
 }
 
 impl PeerCountersAtomic {

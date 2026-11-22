@@ -16,6 +16,7 @@
 //   - 2026-11-22: incoming peers may use a hybrid torrent's truncated v2 info hash.
 //   - 2026-11-22: v2-only magnet links ("btmh" only): found under the truncated v2 hash, the
 //     metadata is checked with SHA-256 and the piece layers come from the same peer.
+//   - 2026-11-22: the choker task and upload slots (set_upload_slots, choke_interval option).
 // Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
 
 use std::{
@@ -139,6 +140,8 @@ pub struct Session {
     dht: Option<Dht>,
     /// qbt-rs: our external address as peers see it (see external_ip.rs).
     pub external_ip: crate::external_ip::ExternalIpVoter,
+    /// qbt-rs: upload slots for the choker (crate::choker).
+    pub(crate) upload_slots: crate::choker::UploadSlots,
     pub(crate) connector: Arc<StreamConnector>,
     pub(crate) reqwest_client: reqwest::Client,
     udp_tracker_client: UdpTrackerClient,
@@ -515,6 +518,10 @@ pub struct SessionOptions {
     /// Override the client name and version used in User-Agent headers and
     /// peer extended handshakes. Defaults to "rqbit X.Y.Z".
     pub client_name_and_version: Option<String>,
+
+    /// qbt-rs: how often the choker recalculates the unchoked peers (default 15 s,
+    /// libtorrent's unchoke_interval; tests use shorter intervals).
+    pub choke_interval: Option<Duration>,
 }
 
 impl Default for SessionOptions {
@@ -543,6 +550,7 @@ impl Default for SessionOptions {
             disable_local_service_discovery: false,
             ipv4_only: false,
             client_name_and_version: None,
+            choke_interval: None,
         }
     }
 }
@@ -848,6 +856,7 @@ impl Session {
                 peer_id,
                 dht,
                 external_ip: Default::default(),
+                upload_slots: Default::default(),
                 peer_opts,
                 spawner: spawner.clone(),
                 output_folder: default_output_folder,
@@ -879,6 +888,16 @@ impl Session {
                 allowlist,
                 lsd,
             });
+
+            // qbt-rs: the choker (upload slots, optimistic unchoke) for all torrents.
+            session.spawn(
+                debug_span!(parent: session.rs(), "choker"),
+                "choker",
+                crate::choker::task_choker(
+                    Arc::downgrade(&session),
+                    opts.choke_interval.unwrap_or(crate::choker::DEFAULT_CHOKE_INTERVAL),
+                ),
+            );
 
             if let Some(mut listen) = listen_result {
                 if let Some(tcp) = listen.tcp_socket.take() {
@@ -920,6 +939,26 @@ impl Session {
                         debug_span!(parent: session.rs(), "upnp_forward", port = announce_port),
                         "upnp_forward",
                         Self::task_upnp_port_forwarder(announce_port, bind_device),
+                    );
+                }
+                // qbt-rs: NAT-PMP (RFC 6886) at the default gateway.
+                if listen.enable_natpmp_port_forwarding
+                    && let Some(announce_port) = listen.announce_port
+                {
+                    info!(port = announce_port, "starting NAT-PMP port forwarder");
+                    let weak = Arc::downgrade(&session);
+                    session.spawn(
+                        debug_span!(parent: session.rs(), "natpmp_forward", port = announce_port),
+                        "natpmp_forward",
+                        async move {
+                            let gateway = crate::natpmp::default_gateway()?;
+                            crate::natpmp::run_forever(gateway, vec![announce_port], crate::natpmp::LEASE, move |ip| {
+                                if let Some(session) = weak.upgrade() {
+                                    session.external_ip.vote_router(ip.into());
+                                }
+                            })
+                            .await
+                        },
                     );
                 }
             }
@@ -1189,6 +1228,16 @@ impl Session {
         self.cancellation_token.cancel();
         // this sucks, but hopefully will be enough
         tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    /// qbt-rs: upload slots (`None` = unlimited) for the whole session and per torrent;
+    /// defaults to qBittorrent's 20 and 4.
+    pub fn set_upload_slots(&self, global: Option<u32>, per_torrent: Option<u32>) {
+        self.upload_slots.set(global, per_torrent);
+    }
+
+    pub fn upload_slots(&self) -> (Option<u32>, Option<u32>) {
+        self.upload_slots.get()
     }
 
     /// Run a callback given the currently managed torrents.
@@ -1503,6 +1552,9 @@ impl Session {
                     state: ManagedTorrentState::Initializing(initializing),
                     only_files,
                     file_priorities: None,
+                    sequential: false,
+                    first_last_piece: false,
+                    super_seeding: false,
                 }),
                 state_change_notify: Notify::new(),
                 shared: minfo,

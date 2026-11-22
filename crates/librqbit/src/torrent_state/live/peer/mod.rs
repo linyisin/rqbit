@@ -1,3 +1,10 @@
+// Modified by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-22: live state transitions
+// update the piece availability (PeerStates::availability); choke state of live peers
+// (LivePeerState::am_unchoked and friends, see crate::choker); Fast extension (BEP 6) state
+// (supports_fast, allowed_fast, accept_fast) and LivePeerState::forget_inflight_request();
+// super seeding (BEP 16) state (superseed, became_uninterested).
+// Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
+
 pub mod stats;
 
 use std::collections::HashSet;
@@ -146,6 +153,10 @@ impl Peer {
         for counter in [&counters.session_stats, &counters.stats] {
             counter.dec(&self.state);
         }
+        // qbt-rs: a live peer's pieces no longer count as available.
+        if let PeerState::Live(l) = &self.state {
+            counters.availability.remove(&l.bitfield);
+        }
         if let (Some(addr), PeerState::Live(..)) = (self.outgoing_address, &self.state) {
             counters.live_outgoing_peers.write().remove(&addr);
         }
@@ -154,6 +165,13 @@ impl Peer {
     pub fn set_state(&mut self, new: PeerState, counters: &PeerStates) -> PeerState {
         for counter in [&counters.session_stats, &counters.stats] {
             counter.incdec(&self.state, &new);
+        }
+        // qbt-rs: piece availability follows the live peers' bitfields.
+        if let PeerState::Live(l) = &self.state {
+            counters.availability.remove(&l.bitfield);
+        }
+        if let PeerState::Live(l) = &new {
+            counters.availability.add(&l.bitfield);
         }
         if let Some(addr) = self.outgoing_address {
             if matches!(&self.state, PeerState::Live(..)) {
@@ -280,6 +298,38 @@ pub(crate) struct LivePeerState {
     pub tx: PeerTx,
 
     pub connection_kind: ConnectionKind,
+
+    /// qbt-rs: we unchoke this peer (crate::choker). Peers start choked.
+    pub am_unchoked: bool,
+    /// qbt-rs: the unchoke is an optimistic one.
+    pub optimistic: bool,
+    pub last_unchoke: Option<std::time::Instant>,
+    pub last_optimistic: Option<std::time::Instant>,
+    /// qbt-rs: the peer's byte counters at the start of the current choke round.
+    pub round_fetched: u64,
+    pub round_uploaded: u64,
+
+    /// qbt-rs: both sides support the Fast extension (BEP 6).
+    pub supports_fast: bool,
+    pub sent_allowed_fast: bool,
+    /// qbt-rs: Fast extension and super seeding state (boxed: most peers never use it).
+    pub ext: Box<PeerExtensions>,
+}
+
+/// qbt-rs: Fast extension (BEP 6) and super seeding (BEP 16) state of a live peer.
+#[derive(Debug, Default)]
+pub(crate) struct PeerExtensions {
+    /// Pieces the peer lets us request while it chokes us ("allowed fast" received).
+    pub allowed_fast: Vec<u32>,
+    /// Pieces we let the peer request while we choke it, with how many chunks of each we
+    /// served that way.
+    pub accept_fast: Vec<(u32, u32)>,
+    /// `Some` if we super seed to this peer, with the (up to two) pieces we announced to it,
+    /// newest first (libtorrent's m_superseed_piece).
+    pub superseed: Option<[Option<u32>; 2]>,
+    /// When the peer last said it is not interested (super seeding offers another piece after
+    /// 10 s).
+    pub became_uninterested: Option<std::time::Instant>,
 }
 
 impl LivePeerState {
@@ -300,6 +350,15 @@ impl LivePeerState {
             request_slots_changed: Default::default(),
             tx,
             connection_kind,
+            am_unchoked: false,
+            optimistic: false,
+            last_unchoke: None,
+            last_optimistic: None,
+            round_fetched: 0,
+            round_uploaded: 0,
+            supports_fast: false,
+            sent_allowed_fast: false,
+            ext: Box::default(),
         }
     }
 
@@ -333,6 +392,15 @@ impl LivePeerState {
         } else {
             RemoveInflightRequestResult::Unexpected
         }
+    }
+
+    /// qbt-rs: drops a request the peer rejected (Fast extension). Returns whether it was ours.
+    pub fn forget_inflight_request(&mut self, chunk: &ChunkInfo) -> bool {
+        let removed = self.inflight_requests.remove(chunk);
+        if removed {
+            self.request_slots_changed.notify_waiters();
+        }
+        removed
     }
 
     pub fn cancel_inflight_requests_for_piece(&mut self, piece: ValidPieceIndex) {

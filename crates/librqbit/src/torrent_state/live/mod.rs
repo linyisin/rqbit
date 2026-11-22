@@ -14,6 +14,21 @@
 //   - 2026-11-22: v2-only torrents: requests stop at the end of each file's data (BEP 52 peers
 //     never send padding; libtorrent's piece_size_for_req), padding-only blocks are filled in
 //     locally, and the shorter answers are accepted (on_received_piece).
+//   - 2026-11-22: download limits (per torrent and global) are taken when a block arrives, not
+//     when it is requested, so they take effect right away on busy swarms.
+//   - 2026-11-22: piece availability (peers.availability) and libtorrent-style piece picking:
+//     rarest first by default, optional sequential download and first/last piece priority
+//     (set_piece_picking, crate::piece_picker).
+//   - 2026-11-22: choking (crate::choker): peers start choked, are unchoked by the session's
+//     choker or right away when a slot is free; requests from choked peers are ignored.
+//   - 2026-11-22: the Fast extension (BEP 6, crate::fast_extension): have all / have none,
+//     reject request (sent to choked or invalid requests, and for queued requests once a peer is
+//     choked; received ones give the piece back), allowed fast in both directions; suggest piece
+//     is accepted and ignored.
+//   - 2026-11-22: super seeding (BEP 16, libtorrent's non-strict mode): set_super_seeding; peers
+//     that connect while we super seed see no pieces, then two at a time (rarest first); "not
+//     interested" is now recorded; "have" is sent to peers that have the piece too (libtorrent's
+//     send_redundant_have); a peer's requester wakes up when the peer announces a piece.
 // Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
 
 // The main logic of rqbit is here - connecting to peers, reading and writing messages
@@ -150,6 +165,14 @@ pub(crate) struct TorrentStateLocked {
     // The sorted file list in which order to download them.
     file_priorities: FilePriorities,
 
+    /// qbt-rs: priority of every piece (file priorities, first/last pieces), see
+    /// crate::piece_picker::piece_priorities.
+    piece_priorities: Vec<u8>,
+    /// qbt-rs: download in piece order instead of rarest first.
+    sequential: bool,
+    /// qbt-rs: random tie-break for rarest first, fixed for this live session.
+    picker_seed: u64,
+
     // If this is None, then it was already used
     fatal_errors_tx: Option<tokio::sync::oneshot::Sender<anyhow::Error>>,
 
@@ -230,10 +253,13 @@ pub struct TorrentStateLive {
     have_broadcast_tx: tokio::sync::broadcast::Sender<ValidPieceIndex>,
 
     ratelimit_upload_tx: tokio::sync::mpsc::UnboundedSender<(
+        PeerHandle,
         tokio::sync::mpsc::UnboundedSender<WriterRequest>,
         ChunkInfo,
     )>,
     ratelimits: Arc<Limits>,
+    /// qbt-rs: super seeding is on (it only applies while we have every piece).
+    super_seeding: AtomicBool,
 }
 
 impl TorrentStateLive {
@@ -270,6 +296,7 @@ impl TorrentStateLive {
         let (have_broadcast_tx, _) = tokio::sync::broadcast::channel(128);
 
         let (ratelimit_upload_tx, ratelimit_upload_rx) = tokio::sync::mpsc::unbounded_channel::<(
+            PeerHandle,
             tokio::sync::mpsc::UnboundedSender<WriterRequest>,
             ChunkInfo,
         )>();
@@ -283,10 +310,20 @@ impl TorrentStateLive {
                 stats: Default::default(),
                 states: Default::default(),
                 live_outgoing_peers: Default::default(),
+                availability: crate::piece_picker::PieceAvailability::new(lengths.total_pieces() as usize),
             },
             _locked: RwLock::new(TorrentStateLocked {
                 pieces: Some(PieceTracker::new(paused.chunk_tracker)),
                 file_priorities,
+                piece_priorities: crate::piece_picker::piece_priorities(
+                    &paused.metadata.file_infos,
+                    None,
+                    false,
+                    lengths.total_pieces() as usize,
+                    lengths.default_piece_length() as u64,
+                ),
+                sequential: false,
+                picker_seed: rand::random(),
                 fatal_errors_tx: Some(fatal_errors_tx),
                 unflushed_bitv_bytes: 0,
             }),
@@ -313,6 +350,7 @@ impl TorrentStateLive {
                 .collect(),
             ratelimit_upload_tx,
             ratelimits,
+            super_seeding: AtomicBool::new(false),
         });
 
         state.spawn(
@@ -456,11 +494,32 @@ impl TorrentStateLive {
     async fn task_upload_scheduler(
         self: Arc<Self>,
         mut rx: tokio::sync::mpsc::UnboundedReceiver<(
+            PeerHandle,
             tokio::sync::mpsc::UnboundedSender<WriterRequest>,
             ChunkInfo,
         )>,
     ) -> crate::Result<()> {
-        while let Some((tx, ci)) = rx.recv().await {
+        while let Some((addr, tx, ci)) = rx.recv().await {
+            // qbt-rs: requests still queued when the peer got choked are rejected (Fast
+            // extension) or dropped, except for its allowed fast pieces (libtorrent's send_choke).
+            let (allowed, fast) = self
+                .peers
+                .with_live(addr, |l| {
+                    let allowed = l.am_unchoked
+                        || l.ext.accept_fast.iter().any(|(p, _)| *p == ci.piece_index.get());
+                    (allowed, l.supports_fast)
+                })
+                .unwrap_or((false, false));
+            if !allowed {
+                if fast {
+                    let _ = tx.send(WriterRequest::Message(Message::RejectRequest(Request {
+                        index: ci.piece_index.get(),
+                        begin: ci.offset,
+                        length: ci.size,
+                    })));
+                }
+                continue;
+            }
             tokio::select! {
                 _ = tx.closed() => {
                     continue;
@@ -723,8 +782,16 @@ impl TorrentStateLive {
     }
 
     fn set_peer_live(&self, handle: PeerHandle, h: Handshake, connection_kind: ConnectionKind) {
+        let super_seed = self.super_seeding_active();
         self.peers.with_peer_mut(handle, "set_peer_live", |p| {
             p.connecting_to_live(h.peer_id, &self.peers, connection_kind);
+            // qbt-rs: we always set the Fast extension bit, so the peer's bit decides. Incoming
+            // peers are already live here.
+            if let Some(live) = p.get_live_mut() {
+                live.supports_fast = h.supports_fast();
+                // qbt-rs: super seeding applies to the peers that connect while it is on.
+                live.ext.superseed = super_seed.then_some([None, None]);
+            }
         });
     }
 
@@ -866,12 +933,263 @@ impl TorrentStateLive {
         Err(res)
     }
 
-    /// qbt-rs: re-sort the order in which files are downloaded (see `file_download_order`).
-    /// Pieces already in flight are not affected; the next pieces requested follow the new order.
-    pub(crate) fn set_file_priorities(&self, priorities: Option<&[u8]>) {
-        let order = crate::file_info::file_download_order(&self.metadata.file_infos, priorities);
-        self.lock_write("set_file_priorities").file_priorities = order;
+    /// qbt-rs: how the next pieces are picked: file priorities (index = file index, `None` =
+    /// all normal), sequential download and "first and last pieces first". Pieces already in
+    /// flight are not affected.
+    pub(crate) fn set_piece_picking(&self, file_priorities: Option<&[u8]>, sequential: bool, first_last: bool) {
+        let order = crate::file_info::file_download_order(&self.metadata.file_infos, file_priorities);
+        let priorities = crate::piece_picker::piece_priorities(
+            &self.metadata.file_infos,
+            file_priorities,
+            first_last,
+            self.lengths.total_pieces() as usize,
+            self.lengths.default_piece_length() as u64,
+        );
+        let mut g = self.lock_write("set_piece_picking");
+        g.file_priorities = order;
+        g.piece_priorities = priorities;
+        g.sequential = sequential;
     }
+
+    /// qbt-rs: the live peers as the choker sees them (bytes since the last round).
+    pub(crate) fn choke_candidates(&self) -> Vec<(PeerHandle, crate::choker::Candidate)> {
+        use crate::choker::{Candidate, ChokeState};
+        self.peers
+            .states
+            .iter()
+            .filter_map(|e| {
+                let peer = e.value();
+                let live = peer.get_live()?;
+                let fetched = peer.stats.counters.fetched_bytes.load(Ordering::Relaxed);
+                let uploaded = peer.stats.counters.uploaded_bytes.load(Ordering::Relaxed);
+                let state = match (live.am_unchoked, live.optimistic) {
+                    (false, _) => ChokeState::Choked,
+                    (true, false) => ChokeState::Unchoked,
+                    (true, true) => ChokeState::Optimistic,
+                };
+                Some((
+                    *e.key(),
+                    Candidate {
+                        torrent: 0,
+                        interested: live.peer_interested,
+                        state,
+                        downloaded: fetched.saturating_sub(live.round_fetched),
+                        uploaded: uploaded.saturating_sub(live.round_uploaded),
+                        last_unchoke: live.last_unchoke,
+                        last_optimistic: live.last_optimistic,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    /// qbt-rs: super seeding (BEP 16). Turning it on affects peers that connect from now on;
+    /// turning it off shows every piece to the peers we were super seeding to.
+    pub(crate) fn set_super_seeding(&self, on: bool) {
+        if self.super_seeding.swap(on, Ordering::Relaxed) == on || on {
+            return;
+        }
+        let total = self.lengths.total_pieces();
+        let addrs: Vec<_> = self
+            .peers
+            .states
+            .iter()
+            .filter(|e| e.value().get_live().is_some_and(|l| l.ext.superseed.is_some()))
+            .map(|e| *e.key())
+            .collect();
+        for addr in addrs {
+            self.peers.with_live_mut(addr, "end super seeding", |live| {
+                live.ext.superseed = None;
+                if live.supports_fast {
+                    let _ = live.tx.send(WriterRequest::Message(Message::HaveAll));
+                    return;
+                }
+                for piece in 0..total {
+                    if !live.bitfield.get(piece as usize).is_some_and(|b| *b) {
+                        let _ = live.tx.send(WriterRequest::Message(Message::Have(piece)));
+                    }
+                }
+            });
+        }
+    }
+
+    /// qbt-rs: super seeding is on and we are a seed (libtorrent turns it off otherwise).
+    pub(crate) fn super_seeding_active(&self) -> bool {
+        if !self.super_seeding.load(Ordering::Relaxed) {
+            return false;
+        }
+        let total = self.lengths.total_pieces() as usize;
+        let g = self.lock_read("super_seeding_active");
+        g.get_chunks()
+            .ok()
+            .and_then(|c| c.get_have_pieces().as_slice().get(..total).map(|h| h.all()))
+            .unwrap_or(false)
+    }
+
+    /// A piece the peer doesn't have, as rare as possible, preferring pieces we aren't super
+    /// seeding to anyone else; random among equals (libtorrent's get_piece_to_super_seed).
+    fn pick_super_seed_piece(&self, peer_has: &BF) -> Option<u32> {
+        use rand::RngExt;
+        let mut superseeded = HashSet::new();
+        for e in self.peers.states.iter() {
+            if let Some(slots) = e.value().get_live().and_then(|l| l.ext.superseed) {
+                superseeded.extend(slots.into_iter().flatten());
+            }
+        }
+        let availability = self.peers.availability.snapshot();
+        let mut best = Vec::new();
+        let mut min = u32::MAX;
+        for (piece, &avail) in (0u32..).zip(availability.iter()) {
+            if peer_has.get(piece as usize).is_some_and(|b| *b) {
+                continue;
+            }
+            let avail = if superseeded.contains(&piece) { 999 } else { avail };
+            if avail < min {
+                min = avail;
+                best.clear();
+            }
+            if avail == min {
+                best.push(piece);
+            }
+        }
+        if best.is_empty() {
+            return None;
+        }
+        Some(best[rand::rng().random_range(0..best.len())])
+    }
+
+    /// Announces one more piece to a peer we super seed to. `replace`: the peer now has this
+    /// one of its announced pieces.
+    fn offer_super_seed_piece(&self, addr: PeerHandle, replace: Option<u32>) {
+        let Some(bitfield) = self
+            .peers
+            .with_live(addr, |l| l.ext.superseed.map(|_| l.bitfield.clone()))
+            .flatten()
+        else {
+            return;
+        };
+        let new = self.pick_super_seed_piece(&bitfield);
+        self.peers.with_live_mut(addr, "offer_super_seed_piece", |live| {
+            let Some(slots) = live.ext.superseed.as_mut() else { return };
+            if let Some(replace) = replace {
+                // Move the piece being replaced to the tail (libtorrent's superseed_piece).
+                if slots[0] == Some(replace) {
+                    slots.swap(0, 1);
+                }
+                if slots[1] == Some(replace) {
+                    slots[1] = None;
+                }
+            }
+            let Some(new) = new else { return };
+            if live.tx.send(WriterRequest::Message(Message::Have(new))).is_ok() {
+                slots[1] = slots[0];
+                slots[0] = Some(new);
+            }
+        });
+    }
+
+    /// Makes sure a peer we super seed to has two pieces to download.
+    fn super_seed_fill(&self, addr: PeerHandle) {
+        for _ in 0..2 {
+            let empty = self
+                .peers
+                .with_live(addr, |l| l.ext.superseed.is_some_and(|s| s.contains(&None)))
+                .unwrap_or(false);
+            if !empty {
+                return;
+            }
+            let before = self.peers.with_live(addr, |l| l.ext.superseed).flatten();
+            self.offer_super_seed_piece(addr, None);
+            if self.peers.with_live(addr, |l| l.ext.superseed).flatten() == before {
+                return; // nothing left to offer
+            }
+        }
+    }
+
+    /// qbt-rs: run by the choker every round: a peer that has not been interested for 10 s gets
+    /// another piece (libtorrent's second_tick).
+    pub(crate) fn super_seed_tick(&self) {
+        let now = Instant::now();
+        let idle: Vec<_> = self
+            .peers
+            .states
+            .iter()
+            .filter(|e| {
+                e.value().get_live().is_some_and(|l| {
+                    l.ext.superseed.is_some()
+                        && !l.peer_interested
+                        && l.ext.became_uninterested
+                            .is_some_and(|t| now.duration_since(t) >= Duration::from_secs(10))
+                })
+            })
+            .map(|e| *e.key())
+            .collect();
+        for addr in idle {
+            self.offer_super_seed_piece(addr, None);
+        }
+    }
+
+    /// qbt-rs: the pieces `addr` told us it has (tests).
+    #[cfg(test)]
+    pub(crate) fn peer_pieces(&self, addr: PeerHandle) -> Option<Vec<u32>> {
+        self.peers
+            .with_live(addr, |l| (0u32..).zip(l.bitfield.iter()).filter(|(_, b)| **b).map(|(i, _)| i).collect())
+    }
+
+    /// qbt-rs: the pieces of the blocks we have requested from `addr` (tests).
+    #[cfg(test)]
+    pub(crate) fn inflight_request_pieces(&self, addr: PeerHandle) -> Option<Vec<u32>> {
+        self.peers
+            .with_live(addr, |l| l.inflight_requests().map(|r| r.piece_index.get()).collect())
+    }
+
+    /// qbt-rs: how many peers of this torrent we unchoke (tests).
+    #[cfg(test)]
+    pub(crate) fn unchoked_peers(&self) -> u32 {
+        self.peers.stats.unchoked.load(Ordering::Relaxed)
+    }
+
+    /// qbt-rs: choke or unchoke a live peer (sends the message when it changes). `new_round`
+    /// starts a new byte-counting round for the choker.
+    pub(crate) fn set_choke_state(&self, addr: PeerHandle, state: crate::choker::ChokeState, new_round: bool) {
+        use peer::stats::atomic::conn_flags::{LOCAL_UNCHOKED, OPTIMISTIC};
+        let peers = &self.peers;
+        peers.with_peer_mut(addr, "set_choke_state", |peer| {
+            let counters = peer.stats.counters.clone();
+            let Some(live) = peer.get_live_mut() else { return };
+            if new_round {
+                live.round_fetched = counters.fetched_bytes.load(Ordering::Relaxed);
+                live.round_uploaded = counters.uploaded_bytes.load(Ordering::Relaxed);
+            }
+            let unchoke = state.is_unchoked();
+            let optimistic = state == crate::choker::ChokeState::Optimistic;
+            if optimistic && !live.optimistic {
+                live.last_optimistic = Some(std::time::Instant::now());
+            }
+            live.optimistic = optimistic;
+            counters.set_conn_flag(OPTIMISTIC, optimistic);
+            if unchoke == live.am_unchoked {
+                return;
+            }
+            let message = if unchoke { Message::Unchoke } else { Message::Choke };
+            if live.tx.send(WriterRequest::Message(message)).is_err() {
+                return;
+            }
+            live.am_unchoked = unchoke;
+            if unchoke {
+                live.last_unchoke = Some(std::time::Instant::now());
+            }
+            counters.set_conn_flag(LOCAL_UNCHOKED, unchoke);
+            peers.stats.unchoked_changed(unchoke);
+            peers.session_stats.unchoked_changed(unchoke);
+        });
+    }
+
+    /// qbt-rs: how many connected peers have each piece.
+    pub(crate) fn piece_availability(&self) -> Vec<u32> {
+        self.peers.availability.snapshot()
+    }
+
 
     /// qbt-rs: the current file download order (file indices). Used by tests.
     #[cfg(test)]
@@ -1303,10 +1621,11 @@ impl PeerConnectionHandler for &'_ PeerHandler {
     async fn on_received_message(&self, message: Message<'_>) -> anyhow::Result<()> {
         // The first message must be "bitfield", but if it's not sent,
         // assume the bitfield is all zeroes and was sent.
-        if !matches!(&message, Message::Bitfield(..))
+        if !matches!(&message, Message::Bitfield(..) | Message::HaveAll | Message::HaveNone)
             && !self.first_message_received.swap(true, Ordering::Relaxed)
         {
             self.on_bitfield_notify.notify_waiters();
+            self.state.super_seed_fill(self.addr);
         }
 
         match message {
@@ -1329,7 +1648,13 @@ impl PeerConnectionHandler for &'_ PeerHandler {
             }
             Message::Have(h) => self.on_have(h),
             Message::NotInterested => {
-                trace!("received \"not interested\", but we don't process it yet")
+                // qbt-rs: recorded for the choker and super seeding.
+                self.state
+                    .peers
+                    .with_live_mut(self.addr, "not interested", |live| {
+                        live.peer_interested = false;
+                        live.ext.became_uninterested = Some(Instant::now());
+                    });
             }
             Message::Cancel(_) => {
                 trace!("received \"cancel\", but we don't process it yet")
@@ -1357,6 +1682,15 @@ impl PeerConnectionHandler for &'_ PeerHandler {
             Message::Hashes(_) | Message::HashReject(_) => {
                 trace!("received hashes / hash reject, but we never ask for hashes");
             }
+            // qbt-rs: Fast extension (BEP 6).
+            Message::HaveAll => self.on_have_all_or_none(true)?,
+            Message::HaveNone => self.on_have_all_or_none(false)?,
+            Message::RejectRequest(request) => self.on_reject_request(request)?,
+            Message::AllowedFast(index) => self.on_allowed_fast(index)?,
+            Message::SuggestPiece(index) => {
+                self.require_fast("suggest piece")?;
+                trace!(index, "received suggest piece; suggestions are only advisory, ignoring");
+            }
             Message::Extended(ExtendedMessage::UtPex(pex)) => {
                 if self.state.metadata.info.info().private {
                     warn!(
@@ -1380,9 +1714,16 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         Ok(())
     }
 
-    fn serialize_bitfield_message_to_buf(&self, buf: &mut [u8]) -> anyhow::Result<usize> {
+    fn serialize_bitfield_message_to_buf(&self, buf: &mut [u8], fast: bool) -> anyhow::Result<usize> {
         let g = self.state.lock_read("serialize_bitfield_message_to_buf");
-        let msg = Message::Bitfield(ByteBuf(g.get_chunks()?.get_have_pieces().as_bytes()));
+        let have = g.get_chunks()?.get_have_pieces();
+        let total = self.state.lengths.total_pieces() as usize;
+        // qbt-rs: Fast extension: "have all" / "have none" instead of a full or empty bitfield.
+        let msg = match have.as_slice().get(..total) {
+            Some(h) if fast && h.all() => Message::HaveAll,
+            Some(h) if fast && h.not_any() => Message::HaveNone,
+            _ => Message::Bitfield(ByteBuf(have.as_bytes())),
+        };
         let len = msg.serialize(buf, &Default::default)?;
         trace!("sending: {:?}, length={}", &msg, len);
         Ok(len)
@@ -1473,26 +1814,32 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         Ok(())
     }
 
+    fn unchoke_on_connect(&self) -> bool {
+        false
+    }
+
     fn should_send_bitfield(&self) -> bool {
         if self.state.torrent().options.disable_upload() {
+            return false;
+        }
+        // qbt-rs: super seeding: pretend to have nothing ("have none" with the fast extension).
+        if self
+            .state
+            .peers
+            .with_live(self.addr, |l| l.ext.superseed.is_some())
+            .unwrap_or(false)
+        {
             return false;
         }
 
         self.state.get_approx_have_bytes() > 0
     }
 
-    fn should_transmit_have(&self, id: ValidPieceIndex) -> bool {
-        if self.state.shared.options.disable_upload() {
-            return false;
-        }
-        let have = self
-            .state
-            .peers
-            .with_live(self.addr, |l| {
-                l.bitfield.get(id.get_usize()).map(|p| *p).unwrap_or(true)
-            })
-            .unwrap_or(true);
-        !have
+    fn should_transmit_have(&self, _id: ValidPieceIndex) -> bool {
+        // qbt-rs: "have" goes to every peer, also those that have the piece already, like
+        // libtorrent (send_redundant_have defaults to true). A super seeder only learns this way
+        // that we finished a piece it announced to us.
+        !self.state.shared.options.disable_upload()
     }
 
     fn update_my_extended_handshake(
@@ -1676,10 +2023,8 @@ impl PeerHandler {
     ///
     /// Returns the piece index to download, or None if no pieces are available.
     fn acquire_next_piece(&self) -> crate::Result<Option<ValidPieceIndex>> {
-        if self.is_choked() {
-            debug!("we are choked, can't acquire piece");
-            return Ok(None);
-        }
+        // qbt-rs: while choked only the peer's allowed fast pieces may be requested (BEP 6).
+        let choked = self.is_choked();
 
         // Steal info to process after releasing the peer lock
         let mut steal_info: Option<(SocketAddr, ValidPieceIndex)> = None;
@@ -1690,11 +2035,19 @@ impl PeerHandler {
             .with_live_mut(self.addr, "acquire_next_piece", |live| {
                 let mut g = self.state.lock_write("acquire_next_piece");
 
+                if choked && live.ext.allowed_fast.is_empty() {
+                    debug!("we are choked, can't acquire piece");
+                    return Ok(None);
+                }
                 let bf = &live.bitfield;
+                let allowed_fast = &live.ext.allowed_fast;
                 // Extract references to disjoint fields
                 let TorrentStateLocked {
                     pieces,
                     file_priorities,
+                    piece_priorities,
+                    sequential,
+                    picker_seed,
                     ..
                 } = &mut **g;
                 let pieces = pieces.as_mut().ok_or(Error::ChunkTrackerEmpty)?;
@@ -1704,12 +2057,22 @@ impl PeerHandler {
                     priority_pieces: self.state.streams.iter_next_pieces(&self.state.lengths),
                     file_priorities,
                     file_infos: &self.state.metadata.file_infos,
-                    peer_has_piece: |p| bf.get(p.get() as usize).map(|v| *v) == Some(true),
+                    peer_has_piece: |p| {
+                        bf.get(p.get() as usize).map(|v| *v) == Some(true)
+                            && (!choked || allowed_fast.contains(&p.get()))
+                    },
                     can_steal: |p| {
-                        self.state.per_piece_locks[p.get_usize()]
+                        !choked
+                            && self.state.per_piece_locks[p.get_usize()]
                             .try_write()
                             .is_some()
                     },
+                    picking: Some(crate::piece_picker::PickOptions {
+                        priorities: piece_priorities,
+                        availability: &self.state.peers.availability,
+                        sequential: *sequential,
+                        seed: *picker_seed,
+                    }),
                 });
 
                 match result {
@@ -1741,9 +2104,34 @@ impl PeerHandler {
         if self.state.torrent().options.disable_upload() {
             anyhow::bail!("upload disabled, but peer requested a piece")
         }
+        let fast = self.peer_supports_fast();
+        // qbt-rs: with the Fast extension bad requests are rejected instead of dropping the peer
+        // (libtorrent's incoming_request).
+        let reject = || -> anyhow::Result<()> {
+            trace!(?request, "rejecting request");
+            self.tx
+                .send(WriterRequest::Message(Message::RejectRequest(request)))
+                .map_err(|_| anyhow::anyhow!("peer writer is gone"))
+        };
+        // qbt-rs: requests from peers we choke are rejected (Fast extension) or ignored (like
+        // libtorrent), except for the allowed fast pieces we offered.
+        if self.counters.conn_flags.load(Ordering::Relaxed) & peer::stats::atomic::conn_flags::LOCAL_UNCHOKED == 0
+            && !(fast && self.take_accept_fast(request.index))
+        {
+            trace!(?request, "request from a choked peer");
+            return if fast { reject() } else { Ok(()) };
+        }
+        // qbt-rs: super seeding: only the pieces we announced to this peer.
+        if let Some(slots) = self.state.peers.with_live(self.addr, |l| l.ext.superseed).flatten()
+            && !slots.contains(&Some(request.index))
+        {
+            trace!(?request, "request for a piece we don't super seed to this peer");
+            return if fast { reject() } else { Ok(()) };
+        }
 
         let piece_index = match self.state.lengths.validate_piece_index(request.index) {
             Some(p) => p,
+            None if fast => return reject(),
             None => {
                 anyhow::bail!(
                     "received {:?}, but it is not a valid chunk request (piece index is invalid). Ignoring.",
@@ -1753,27 +2141,9 @@ impl PeerHandler {
         };
 
         // BitTorrent v2: peers don't request the padding at the end of a file's last piece.
-        let v2_data_len = self
-            .state
-            .metadata
-            .info
-            .v2_hashes()
-            .and_then(|h| h.piece_data_len(piece_index.get()));
-        let chunk_info = match v2_data_len {
-            Some(data_len) => self.state.lengths.chunk_info_from_received_data_v2(
-                piece_index,
-                request.begin,
-                request.length,
-                data_len,
-            ),
-            None => self.state.lengths.chunk_info_from_received_data(
-                piece_index,
-                request.begin,
-                request.length,
-            ),
-        };
-        let chunk_info = match chunk_info {
+        let chunk_info = match self.chunk_info_for_request(piece_index, &request) {
             Some(d) => d,
+            None if fast => return reject(),
             None => {
                 anyhow::bail!(
                     "received {:?}, but it is not a valid chunk request (chunk data is invalid). Ignoring.",
@@ -1788,6 +2158,9 @@ impl PeerHandler {
             .get_chunks()?
             .is_chunk_ready_to_upload(&chunk_info)
         {
+            if fast {
+                return reject();
+            }
             anyhow::bail!(
                 "got request for a chunk that is not ready to upload. chunk {:?}",
                 chunk_info
@@ -1796,7 +2169,7 @@ impl PeerHandler {
 
         self.state
             .ratelimit_upload_tx
-            .send((self.tx.clone(), chunk_info))?;
+            .send((self.addr, self.tx.clone(), chunk_info))?;
         Ok(())
     }
 
@@ -1810,7 +2183,13 @@ impl PeerHandler {
                     live.bitfield = make_piece_bitfield(&self.state.lengths);
                 }
                 match live.bitfield.get_mut(have as usize) {
-                    Some(mut v) => *v = true,
+                    Some(mut v) => {
+                        // qbt-rs: one more peer has this piece.
+                        if !*v {
+                            *v = true;
+                            self.state.peers.availability.inc(have as usize);
+                        }
+                    }
                     None => {
                         warn!(
                             id = self.state.shared.id,
@@ -1831,6 +2210,16 @@ impl PeerHandler {
                 }
             });
         self.on_bitfield_notify.notify_waiters();
+        // qbt-rs: super seeding: the peer finished one of the pieces we announced to it, so it
+        // gets the next one (libtorrent's incoming_have).
+        let superseeded = self
+            .state
+            .peers
+            .with_live(self.addr, |l| l.ext.superseed.is_some_and(|s| s.contains(&Some(have))))
+            .unwrap_or(false);
+        if superseeded {
+            self.state.offer_super_seed_piece(self.addr, Some(have));
+        }
     }
 
     fn on_bitfield(&self, bitfield: ByteBufOwned) -> anyhow::Result<()> {
@@ -1852,6 +2241,7 @@ impl PeerHandler {
             .peers
             .update_bitfield(self.addr, bf, self.state.lengths.total_pieces() as usize);
         self.on_bitfield_notify.notify_waiters();
+        self.state.super_seed_fill(self.addr);
         Ok(())
     }
 
@@ -1949,6 +2339,9 @@ impl PeerHandler {
 
             // Acquire a piece using the strategy: try steal (10x) → reserve → steal (3x).
             let new_piece_notify = self.state.new_pieces_notify.notified();
+            // qbt-rs: also wake up when this peer announces a piece (e.g. a super seeder showing
+            // the next one), instead of waiting for the 5 s timer.
+            let peer_has_new = self.on_bitfield_notify.notified();
             let next = match self.acquire_next_piece()? {
                 Some(next) => next,
                 None => {
@@ -1956,7 +2349,12 @@ impl PeerHandler {
                     match aframe!(tokio::time::timeout(
                         // Half of default rw timeout not to race with it.
                         Duration::from_secs(5),
-                        new_piece_notify
+                        async {
+                            tokio::select! {
+                                _ = new_piece_notify => {}
+                                _ = peer_has_new => {}
+                            }
+                        }
                     ))
                     .await
                     {
@@ -2006,20 +2404,9 @@ impl PeerHandler {
                     length: chunk.size,
                 };
 
-                aframe!(self.wait_for_request_slot()).await;
-
-                self.state
-                    .ratelimits
-                    .prepare_for_download(NonZeroU32::new(request.length).unwrap())
-                    .await?;
-
-                if let Some(session) = self.state.torrent().session.upgrade() {
-                    session
-                        .ratelimits
-                        .prepare_for_download(NonZeroU32::new(request.length).unwrap())
-                        .await?;
-                }
-
+                // qbt-rs: the download limit is applied when data arrives (on_received_piece), not
+                // here: with up to 128 requests in flight per peer, limiting requests only slowed
+                // things down after the whole backlog had arrived (tens of MiB on a busy swarm).
                 aframe!(self.wait_for_request_slot()).await;
 
                 match self
@@ -2070,6 +2457,20 @@ impl PeerHandler {
     fn on_peer_interested(&self) {
         trace!("peer is interested");
         self.state.peers.mark_peer_interested(self.addr, true);
+        self.state.super_seed_fill(self.addr);
+        self.send_allowed_fast_set();
+        // qbt-rs: libtorrent's preemptive unchoke: a free upload slot is given right away.
+        if self.state.torrent().options.disable_upload() {
+            return;
+        }
+        if let Some(session) = self.state.torrent().session.upgrade() {
+            let (global, per_torrent) = session.upload_slots.get();
+            let torrent_unchoked = self.state.peers.stats.unchoked.load(Ordering::Relaxed);
+            let session_unchoked = self.state.peers.session_stats.unchoked.load(Ordering::Relaxed);
+            if global.is_none_or(|g| session_unchoked < g) && per_torrent.is_none_or(|p| torrent_unchoked < p) {
+                self.state.set_choke_state(self.addr, crate::choker::ChokeState::Unchoked, false);
+            }
+        }
     }
 
     fn on_i_am_unchoked(&self) {
@@ -2087,6 +2488,15 @@ impl PeerHandler {
             .validate_piece_index(piece.index)
             .with_context(|| format!("peer sent an invalid piece {}", piece.index))?;
         let length: u32 = piece.len().try_into().context("bug")?;
+        // qbt-rs: download limits are applied here, before the next message is read, so a
+        // limited torrent stops reading the socket and TCP slows the peer down (libtorrent also
+        // takes bandwidth quota before reading from the socket).
+        if let Some(len) = NonZeroU32::new(length) {
+            self.state.ratelimits.prepare_for_download(len).await?;
+            if let Some(session) = self.state.torrent().session.upgrade() {
+                session.ratelimits.prepare_for_download(len).await?;
+            }
+        }
         // qbt-rs: BitTorrent v2: the last block of a file comes without its padding.
         let v2_data_len = self
             .state
@@ -2255,6 +2665,206 @@ impl PeerHandler {
         self.lock_flow_control("is_choked").i_am_choked
     }
 
+    // qbt-rs: Fast extension (BEP 6) helpers.
+
+    fn peer_supports_fast(&self) -> bool {
+        self.state
+            .peers
+            .with_live(self.addr, |l| l.supports_fast)
+            .unwrap_or(false)
+    }
+
+    fn require_fast(&self, what: &str) -> anyhow::Result<()> {
+        // BEP 6: a peer receiving a fast extension message without the extension MUST close.
+        if !self.peer_supports_fast() {
+            anyhow::bail!("peer sent \"{what}\" without the fast extension");
+        }
+        Ok(())
+    }
+
+    fn on_have_all_or_none(&self, all: bool) -> anyhow::Result<()> {
+        self.require_fast(if all { "have all" } else { "have none" })?;
+        let total = self.state.lengths.total_pieces() as usize;
+        let mut bf = make_piece_bitfield(&self.state.lengths);
+        if all && let Some(s) = bf.get_mut(..total) {
+            s.fill(true);
+        }
+        self.state.peers.update_bitfield(self.addr, bf, total);
+        self.on_bitfield_notify.notify_waiters();
+        self.state.super_seed_fill(self.addr);
+        Ok(())
+    }
+
+    /// The peer won't send a block we asked for: give the piece back so it can be fetched again
+    /// (from anyone), and cancel the rest of it.
+    fn on_reject_request(&self, request: Request) -> anyhow::Result<()> {
+        self.require_fast("reject request")?;
+        let Some(piece) = self.state.lengths.validate_piece_index(request.index) else {
+            debug!(?request, "invalid reject, ignoring");
+            return Ok(());
+        };
+        let Some(chunk) = self.chunk_info_for_request(piece, &request) else {
+            debug!(?request, "invalid reject, ignoring");
+            return Ok(());
+        };
+        let ours = self
+            .state
+            .peers
+            .with_live_mut(self.addr, "on_reject_request", |live| {
+                live.forget_inflight_request(&chunk)
+            })
+            .unwrap_or(false);
+        if !ours {
+            // E.g. the answer to a cancel we sent.
+            trace!(?request, "reject for a request we don't have in flight");
+            return Ok(());
+        }
+        let released = self
+            .state
+            .lock_write("on_reject_request")
+            .get_pieces_mut()?
+            .release_piece_owned_by(piece, self.addr);
+        self.state
+            .peers
+            .with_live_mut(self.addr, "cancel rejected piece", |live| {
+                live.cancel_inflight_requests_for_piece(piece)
+            });
+        if released {
+            self.state.new_pieces_notify.notify_waiters();
+        }
+        Ok(())
+    }
+
+    fn on_allowed_fast(&self, index: u32) -> anyhow::Result<()> {
+        self.require_fast("allowed fast")?;
+        let Some(piece) = self.state.lengths.validate_piece_index(index) else {
+            debug!(index, "allowed fast for an invalid piece, ignoring");
+            return Ok(());
+        };
+        let have = self
+            .state
+            .lock_read("on_allowed_fast")
+            .get_chunks()?
+            .get_have_pieces()
+            .as_slice()
+            .get(piece.get_usize())
+            .is_some_and(|b| *b);
+        if have {
+            return Ok(());
+        }
+        self.state
+            .peers
+            .with_live_mut(self.addr, "on_allowed_fast", |live| {
+                if live.ext.allowed_fast.len() < crate::fast_extension::MAX_ALLOWED_FAST_RECEIVED
+                    && !live.ext.allowed_fast.contains(&index)
+                {
+                    live.ext.allowed_fast.push(index);
+                }
+            });
+        self.notify_request_slots_changed();
+        Ok(())
+    }
+
+    /// Whether the choking peer allowed us a piece that it has and we still need.
+    fn has_allowed_fast_to_request(&self) -> bool {
+        let Some(candidates) = self.state.peers.with_live(self.addr, |l| {
+            l.ext.allowed_fast
+                .iter()
+                .copied()
+                .filter(|p| l.bitfield.get(*p as usize).is_some_and(|b| *b))
+                .collect::<Vec<_>>()
+        }) else {
+            return false;
+        };
+        if candidates.is_empty() {
+            return false;
+        }
+        let g = self.state.lock_read("has_allowed_fast_to_request");
+        let Ok(chunks) = g.get_chunks() else {
+            return false;
+        };
+        let have = chunks.get_have_pieces();
+        candidates
+            .iter()
+            .any(|p| !have.as_slice().get(*p as usize).is_some_and(|b| *b))
+    }
+
+    /// Sends our allowed fast set the first time the peer says it is interested (libtorrent
+    /// defers it until then and skips pieces the peer has and peers that are seeds).
+    fn send_allowed_fast_set(&self) {
+        if self.state.torrent().options.disable_upload() {
+            return;
+        }
+        let set = crate::fast_extension::allowed_fast_set(
+            self.addr.ip(),
+            &self.state.shared.info_hash,
+            self.state.lengths.total_pieces(),
+            crate::fast_extension::ALLOWED_FAST_SET_SIZE,
+        );
+        self.state
+            .peers
+            .with_live_mut(self.addr, "send_allowed_fast_set", |live| {
+                // libtorrent sends no allowed fast set while super seeding.
+                if !live.supports_fast || live.sent_allowed_fast || live.seeder || live.ext.superseed.is_some() {
+                    return;
+                }
+                live.sent_allowed_fast = true;
+                for piece in set {
+                    if live.bitfield.get(piece as usize).is_some_and(|b| *b) {
+                        continue;
+                    }
+                    if live
+                        .tx
+                        .send(WriterRequest::Message(Message::AllowedFast(piece)))
+                        .is_err()
+                    {
+                        return;
+                    }
+                    live.ext.accept_fast.push((piece, 0));
+                }
+            });
+    }
+
+    /// A choked peer requests a block of `index`: allowed if it is one of the allowed fast pieces
+    /// we offered and it hasn't fetched it about 3 times already (libtorrent).
+    fn take_accept_fast(&self, index: u32) -> bool {
+        let limit = crate::fast_extension::ALLOWED_FAST_BLOCK_FACTOR
+            * self.state.lengths.default_chunks_per_piece();
+        self.state
+            .peers
+            .with_live_mut(self.addr, "take_accept_fast", |live| {
+                match live.ext.accept_fast.iter_mut().find(|(p, _)| *p == index) {
+                    Some((_, served)) if *served < limit => {
+                        *served += 1;
+                        true
+                    }
+                    _ => false,
+                }
+            })
+            .unwrap_or(false)
+    }
+
+    fn chunk_info_for_request(&self, piece: ValidPieceIndex, request: &Request) -> Option<ChunkInfo> {
+        let v2_data_len = self
+            .state
+            .metadata
+            .info
+            .v2_hashes()
+            .and_then(|h| h.piece_data_len(piece.get()));
+        match v2_data_len {
+            Some(data_len) => self.state.lengths.chunk_info_from_received_data_v2(
+                piece,
+                request.begin,
+                request.length,
+                data_len,
+            ),
+            None => self
+                .state
+                .lengths
+                .chunk_info_from_received_data(piece, request.begin, request.length),
+        }
+    }
+
     fn requested_inflight_count(&self) -> Option<usize> {
         self.state
             .peers
@@ -2267,7 +2877,8 @@ impl PeerHandler {
             (flow.i_am_choked, flow.request_window)
         };
 
-        if i_am_choked {
+        // qbt-rs: a choked peer may still serve its allowed fast pieces (BEP 6).
+        if i_am_choked && !self.has_allowed_fast_to_request() {
             return false;
         }
 

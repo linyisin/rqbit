@@ -3,6 +3,9 @@
 //     UDP BEP 15) after a successful announce at most every 30 minutes.
 //   - 2026-11-22: TrackerStatuses::reannounce() cuts the wait short (also the retry backoff), so
 //     every tracker announces again right away.
+//   - 2026-11-22: HTTP announces and scrapes give up after 30 seconds (libtorrent's
+//     tracker_completion_timeout); the shared HTTP client has no timeout, so an unreachable
+//     tracker used to stay "updating" until the OS gave up on the connection.
 // Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
 
 use std::collections::HashSet;
@@ -63,6 +66,15 @@ impl std::fmt::Display for HttpTrackerFailure {
 impl std::error::Error for HttpTrackerFailure {}
 
 /// qbt-rs: whether an announce error came from the tracker itself or from not reaching it.
+/// qbt-rs: how long one HTTP announce or scrape may take (libtorrent's tracker_completion_timeout).
+const HTTP_TRACKER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// qbt-rs: a GET to an HTTP tracker, with [`HTTP_TRACKER_TIMEOUT`]. The session's client is also
+/// used for web seeds and big downloads, so the timeout is set per request.
+fn http_tracker_get(client: &reqwest::Client, url: Url) -> reqwest::RequestBuilder {
+    client.get(url).timeout(HTTP_TRACKER_TIMEOUT)
+}
+
 fn error_state(e: &anyhow::Error) -> TrackerStatusState {
     if e.downcast_ref::<HttpTrackerFailure>().is_some()
         || e.downcast_ref::<tracker_comms_udp::TrackerReplyError>().is_some()
@@ -375,7 +387,7 @@ impl TrackerComms {
         }
         url.set_query(Some(&queries));
 
-        let response: reqwest::Response = self.reqwest_client.get(url).send().await?;
+        let response: reqwest::Response = http_tracker_get(&self.reqwest_client, url).send().await?;
         if !response.status().is_success() {
             anyhow::bail!("tracker responded with {:?}", response.status());
         }
@@ -436,7 +448,7 @@ impl TrackerComms {
         }
         url.set_query(Some(&query));
         let result: anyhow::Result<crate::ScrapeCounts> = async {
-            let response = self.reqwest_client.get(url).send().await?;
+            let response = http_tracker_get(&self.reqwest_client, url).send().await?;
             if !response.status().is_success() {
                 bail!("scrape responded with {:?}", response.status());
             }
@@ -627,5 +639,19 @@ impl TrackerComms {
                 Err(e)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod http_timeout_tests {
+    use super::*;
+
+    #[test]
+    fn tracker_requests_have_a_timeout() {
+        let client = reqwest::Client::new();
+        let request = http_tracker_get(&client, Url::parse("http://127.0.0.1:1/announce").unwrap())
+            .build()
+            .unwrap();
+        assert_eq!(request.timeout(), Some(&HTTP_TRACKER_TIMEOUT));
     }
 }

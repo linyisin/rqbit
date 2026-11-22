@@ -2,6 +2,8 @@
 //   - outgoing connections: encrypted (MSE/PE) handshake per ConnectionOptions::encryption.
 //   - 2026-11-22: PeerConnectionHandler::on_encrypted() reports the MSE/PE result.
 //   - 2026-11-21: WriterRequest::Hashes, the answer to a BitTorrent v2 hash request (BEP 52).
+//   - 2026-11-22: the Fast extension (BEP 6): when both sides support it, the first message is a
+//     bitfield, "have all" or "have none" (serialize_bitfield_message_to_buf gets `fast`).
 // Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
 
 use std::{
@@ -44,7 +46,14 @@ pub trait PeerConnectionHandler {
     /// qbt-rs: the encrypted (MSE/PE) handshake succeeded; `rc4` = the whole stream is encrypted.
     fn on_encrypted(&self, _rc4: bool) {}
     fn should_send_bitfield(&self) -> bool;
-    fn serialize_bitfield_message_to_buf(&self, buf: &mut [u8]) -> anyhow::Result<usize>;
+    /// qbt-rs: unchoke the peer right after the handshake (upstream behaviour). Torrents that
+    /// run the choker (crate::choker) send unchoke messages themselves.
+    fn unchoke_on_connect(&self) -> bool {
+        true
+    }
+    /// `fast`: both sides support the Fast extension (BEP 6), so "have all" / "have none" may be
+    /// sent instead of a bitfield.
+    fn serialize_bitfield_message_to_buf(&self, buf: &mut [u8], fast: bool) -> anyhow::Result<usize>;
     fn on_handshake(&self, handshake: Handshake, ckind: ConnectionKind) -> anyhow::Result<()>;
     fn on_extended_handshake(
         &self,
@@ -128,6 +137,7 @@ pub(crate) async fn with_timeout<T>(
 
 struct ManagePeerArgs {
     handshake_supports_extended: bool,
+    handshake_supports_fast: bool,
     read_buf: ReadBuf,
     write_buf: Box<[u8; MAX_MSG_LEN]>,
     read: BoxAsyncReadVectored,
@@ -200,6 +210,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
 
         // What the peer supports is in the peer's handshake, not in ours.
         let handshake_supports_extended = incoming.handshake.supports_extended();
+        let handshake_supports_fast = incoming.handshake.supports_fast();
 
         self.handler
             .on_handshake(incoming.handshake, incoming.kind)
@@ -207,6 +218,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
 
         self.manage_peer(ManagePeerArgs {
             handshake_supports_extended,
+            handshake_supports_fast,
             read_buf: incoming.read_buf,
             write_buf,
             read: incoming.reader,
@@ -255,6 +267,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             let mut read_buf = ReadBuf::new();
             let h = read_buf.read_handshake(&mut read, rwtimeout).await?;
             let handshake_supports_extended = h.supports_extended();
+            let handshake_supports_fast = h.supports_fast();
             trace!(
                 peer_id=?h.peer_id,
                 decoded_id=?try_decode_peer_id(h.peer_id),
@@ -272,6 +285,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
 
             self.manage_peer(ManagePeerArgs {
                 handshake_supports_extended,
+                handshake_supports_fast,
                 read_buf,
                 write_buf,
                 read,
@@ -343,6 +357,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
     async fn manage_peer(&self, args: ManagePeerArgs) -> Result<()> {
         let ManagePeerArgs {
             handshake_supports_extended,
+            handshake_supports_fast,
             mut read_buf,
             mut write_buf,
             mut read,
@@ -386,11 +401,19 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 .keep_alive_interval
                 .unwrap_or_else(|| Duration::from_secs(120));
 
-            if self.handler.should_send_bitfield() {
-                let len = self
-                    .handler
-                    .serialize_bitfield_message_to_buf(&mut *write_buf)
-                    .map_err(Error::Anyhow)?;
+            // qbt-rs: with the Fast extension one of bitfield / have all / have none must be sent.
+            let initial_have = if self.handler.should_send_bitfield() {
+                Some(
+                    self.handler
+                        .serialize_bitfield_message_to_buf(&mut *write_buf, handshake_supports_fast)
+                        .map_err(Error::Anyhow)?,
+                )
+            } else if handshake_supports_fast {
+                Some(Message::HaveNone.serialize(&mut *write_buf, &Default::default)?)
+            } else {
+                None
+            };
+            if let Some(len) = initial_have {
                 with_timeout(
                     "writing bitfield",
                     rwtimeout,
@@ -400,14 +423,16 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 trace!("sent bitfield");
             }
 
-            let len = Message::Unchoke.serialize(&mut *write_buf, &Default::default)?;
-            with_timeout(
-                "writing",
-                rwtimeout,
-                write.write_all(&write_buf[..len]).map_err(Error::Write),
-            )
-            .await?;
-            trace!("sent unchoke");
+            if self.handler.unchoke_on_connect() {
+                let len = Message::Unchoke.serialize(&mut *write_buf, &Default::default)?;
+                with_timeout(
+                    "writing",
+                    rwtimeout,
+                    write.write_all(&write_buf[..len]).map_err(Error::Write),
+                )
+                .await?;
+                trace!("sent unchoke");
+            }
 
             let mut broadcast_closed = false;
 

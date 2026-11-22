@@ -2,6 +2,9 @@
 //   - ManagedTorrent::reset_for_recheck(), used by Session::recheck() for qBittorrent's
 //     "Force recheck".
 //   - ManagedTorrent::set_file_priorities() / file_priorities(): per-file download priorities.
+//   - 2026-11-22: set_sequential_download(), set_first_last_piece_priority(), piece_availability(),
+//     distributed_copies().
+//   - 2026-11-22: set_super_seeding() / super_seeding() (BEP 16).
 //   - tracker_statuses() (per-tracker announce/scrape status).
 //   - output folder can change (Session::move_storage); save_path(), is_moving(),
 //     stop_for_move(), restore_after_move().
@@ -124,6 +127,14 @@ pub(crate) struct ManagedTorrentLocked {
     /// `None` = all equal. Kept here so they survive pause/unpause (the live state is recreated).
     pub(crate) file_priorities: Option<Vec<u8>>,
     pub(crate) only_files: Option<Vec<usize>>,
+    /// qbt-rs: download pieces in order instead of rarest first (libtorrent's
+    /// sequential_download flag). Survives pause/unpause.
+    pub(crate) sequential: bool,
+    /// qbt-rs: first and last pieces of every file first (qBittorrent's
+    /// firstLastPiecePriority).
+    pub(crate) first_last_piece: bool,
+    /// qbt-rs: super seeding (BEP 16). Survives pause/unpause.
+    pub(crate) super_seeding: bool,
 }
 
 #[derive(Default)]
@@ -577,9 +588,8 @@ impl ManagedTorrent {
                     let paused = g.state.take().assert_paused();
                     let (tx, rx) = tokio::sync::oneshot::channel();
                     let live = TorrentStateLive::new(paused, tx, token.clone())?;
-                    if g.file_priorities.is_some() {
-                        live.set_file_priorities(g.file_priorities.as_deref());
-                    }
+                    live.set_piece_picking(g.file_priorities.as_deref(), g.sequential, g.first_last_piece);
+                    live.set_super_seeding(g.super_seeding);
                     g.state = ManagedTorrentState::Live(live.clone());
                     t.state_change_notify.notify_waiters();
 
@@ -704,9 +714,70 @@ impl ManagedTorrent {
         let mut g = self.locked.write();
         g.file_priorities = priorities;
         if let ManagedTorrentState::Live(live) = &g.state {
-            live.set_file_priorities(g.file_priorities.as_deref());
+            live.set_piece_picking(g.file_priorities.as_deref(), g.sequential, g.first_last_piece);
         }
         Ok(())
+    }
+
+    /// qbt-rs: download pieces in order (libtorrent's sequential_download) instead of rarest
+    /// first. Applied immediately if live and kept across pause/unpause; not persisted by the
+    /// session.
+    pub fn set_sequential_download(&self, enabled: bool) {
+        let mut g = self.locked.write();
+        g.sequential = enabled;
+        if let ManagedTorrentState::Live(live) = &g.state {
+            live.set_piece_picking(g.file_priorities.as_deref(), g.sequential, g.first_last_piece);
+        }
+    }
+
+    pub fn sequential_download(&self) -> bool {
+        self.locked.read().sequential
+    }
+
+    /// qbt-rs: download the first and last pieces of every file first (qBittorrent's
+    /// "Download first and last pieces first"). Same lifetime as `set_sequential_download`.
+    pub fn set_first_last_piece_priority(&self, enabled: bool) {
+        let mut g = self.locked.write();
+        g.first_last_piece = enabled;
+        if let ManagedTorrentState::Live(live) = &g.state {
+            live.set_piece_picking(g.file_priorities.as_deref(), g.sequential, g.first_last_piece);
+        }
+    }
+
+    pub fn first_last_piece_priority(&self) -> bool {
+        self.locked.read().first_last_piece
+    }
+
+    /// qbt-rs: super seeding (BEP 16, qBittorrent's "Super seeding mode"): peers that connect
+    /// while it is on see only a couple of rare pieces at a time, so a new torrent spreads with
+    /// less upload. Only works while we have every piece; peers already connected are not
+    /// affected when it is turned on.
+    pub fn set_super_seeding(&self, enabled: bool) {
+        let mut g = self.locked.write();
+        g.super_seeding = enabled;
+        if let ManagedTorrentState::Live(live) = &g.state {
+            live.set_super_seeding(enabled);
+        }
+    }
+
+    pub fn super_seeding(&self) -> bool {
+        self.locked.read().super_seeding
+    }
+
+    /// qbt-rs: how many connected peers have each piece; `None` when not live.
+    pub fn piece_availability(&self) -> Option<Vec<u32>> {
+        self.live().map(|l| l.piece_availability())
+    }
+
+    /// qbt-rs: libtorrent's "distributed copies" (qBittorrent's Availability column), counting
+    /// the connected peers and ourselves; `None` when not live.
+    pub fn distributed_copies(&self) -> Option<f64> {
+        let availability = self.piece_availability()?;
+        self.with_chunk_tracker(|chunks| {
+            let have = chunks.get_have_pieces();
+            crate::piece_picker::distributed_copies(&availability, |i| have.as_slice().get(i).is_some_and(|b| *b))
+        })
+        .ok()
     }
 
     /// qbt-rs: per-file download priorities set with `set_file_priorities`.

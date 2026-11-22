@@ -1,5 +1,6 @@
 // Modified by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-22: mark_chunk_downloaded() takes
-// the chunk the caller already validated (BitTorrent v2 blocks at the end of a file are shorter).
+// the chunk the caller already validated (BitTorrent v2 blocks at the end of a file are shorter);
+// iter_queued_piece_ids() for the piece picker.
 // Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
 
 use std::collections::HashSet;
@@ -233,6 +234,14 @@ impl ChunkTracker {
             hns.needed_bytes += len * (is_needed as u64);
         }
         hns
+    }
+
+    /// qbt-rs: every queued piece (needed, not in flight, not have), in index order.
+    pub(crate) fn iter_queued_piece_ids(&self) -> impl Iterator<Item = ValidPieceIndex> + '_ {
+        self.queue_pieces
+            .iter_ones()
+            .filter_map(|id| u32::try_from(id).ok())
+            .filter_map(|id| self.lengths.validate_piece_index(id))
     }
 
     pub(crate) fn iter_queued_pieces<'a>(

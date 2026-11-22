@@ -5,6 +5,9 @@
 // Modified by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-21: the BitTorrent v2
 // (BEP 52) "hash request" (21), "hashes" (22) and "hash reject" (23) messages. Licensed under
 // Apache-2.0 like the rest of rqbit.
+//   - 2026-11-22: the Fast extension (BEP 6): reserved bit 0x04 in the last reserved byte and the
+//     suggest piece (13), have all (14), have none (15), reject request (16) and allowed fast
+//     (17) messages.
 
 mod double_buf;
 pub mod extended;
@@ -50,6 +53,12 @@ const MSGID_BITFIELD: MsgId = 5;
 const MSGID_REQUEST: MsgId = 6;
 const MSGID_PIECE: MsgId = 7;
 const MSGID_CANCEL: MsgId = 8;
+// qbt-rs: Fast extension (BEP 6).
+const MSGID_SUGGEST_PIECE: MsgId = 13;
+const MSGID_HAVE_ALL: MsgId = 14;
+const MSGID_HAVE_NONE: MsgId = 15;
+const MSGID_REJECT_REQUEST: MsgId = 16;
+const MSGID_ALLOWED_FAST: MsgId = 17;
 const MSGID_EXTENDED: MsgId = 20;
 const MSGID_HASH_REQUEST: MsgId = 21;
 const MSGID_HASHES: MsgId = 22;
@@ -75,6 +84,11 @@ impl MsgIdDebug {
             MSGID_REQUEST => "request",
             MSGID_PIECE => "piece",
             MSGID_CANCEL => "cancel",
+            MSGID_SUGGEST_PIECE => "suggest_piece",
+            MSGID_HAVE_ALL => "have_all",
+            MSGID_HAVE_NONE => "have_none",
+            MSGID_REJECT_REQUEST => "reject_request",
+            MSGID_ALLOWED_FAST => "allowed_fast",
             MSGID_EXTENDED => "extended",
             MSGID_HASH_REQUEST => "hash_request",
             MSGID_HASHES => "hashes",
@@ -286,6 +300,12 @@ pub enum Message<'a> {
     HashRequest(HashRequest),
     Hashes(Hashes<'a>),
     HashReject(HashRequest),
+    /// qbt-rs: Fast extension (BEP 6).
+    SuggestPiece(u32),
+    HaveAll,
+    HaveNone,
+    RejectRequest(Request),
+    AllowedFast(u32),
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -328,12 +348,15 @@ impl Message<'_> {
         }
 
         match self {
-            Message::Request(request) | Message::Cancel(request) => {
+            Message::Request(request)
+            | Message::Cancel(request)
+            | Message::RejectRequest(request) => {
                 const TOTAL_LEN: usize = PREAMBLE_LEN + INTEGER_LEN * 3;
                 check_len!(TOTAL_LEN);
                 let msg_id = match self {
                     Message::Request(..) => MSGID_REQUEST,
                     Message::Cancel(..) => MSGID_CANCEL,
+                    Message::RejectRequest(..) => MSGID_REJECT_REQUEST,
                     _ => unsafe { unreachable_unchecked() },
                 };
                 write_preamble!((INTEGER_LEN * 3) as u32, msg_id);
@@ -348,13 +371,20 @@ impl Message<'_> {
                 out[PREAMBLE_LEN..PREAMBLE_LEN + block_len].copy_from_slice(b.as_ref());
                 Ok(total_len)
             }
-            Message::Choke | Message::Unchoke | Message::Interested | Message::NotInterested => {
+            Message::Choke
+            | Message::Unchoke
+            | Message::Interested
+            | Message::NotInterested
+            | Message::HaveAll
+            | Message::HaveNone => {
                 check_len!(PREAMBLE_LEN);
                 let msg_id = match self {
                     Message::Choke => MSGID_CHOKE,
                     Message::Unchoke => MSGID_UNCHOKE,
                     Message::Interested => MSGID_INTERESTED,
                     Message::NotInterested => MSGID_NOT_INTERESTED,
+                    Message::HaveAll => MSGID_HAVE_ALL,
+                    Message::HaveNone => MSGID_HAVE_NONE,
                     _ => unsafe { unreachable_unchecked() },
                 };
                 write_preamble!(0, msg_id);
@@ -374,9 +404,15 @@ impl Message<'_> {
                 out[0..4].copy_from_slice(&0u32.to_be_bytes());
                 Ok(4)
             }
-            Message::Have(v) => {
+            Message::Have(v) | Message::SuggestPiece(v) | Message::AllowedFast(v) => {
                 check_len!(PREAMBLE_LEN + INTEGER_LEN);
-                write_preamble!(INTEGER_LEN as u32, MSGID_HAVE);
+                let msg_id = match self {
+                    Message::Have(..) => MSGID_HAVE,
+                    Message::SuggestPiece(..) => MSGID_SUGGEST_PIECE,
+                    Message::AllowedFast(..) => MSGID_ALLOWED_FAST,
+                    _ => unsafe { unreachable_unchecked() },
+                };
+                write_preamble!(INTEGER_LEN as u32, msg_id);
                 out[5..9].copy_from_slice(&v.to_be_bytes());
                 Ok(9)
             }
@@ -483,6 +519,24 @@ impl Message<'_> {
                 let have = buf.read_u32_be().unwrap();
                 Ok((Message::Have(have), total_len))
             }
+            MSGID_SUGGEST_PIECE | MSGID_ALLOWED_FAST => {
+                check_msg_len!(4);
+                let index = buf.read_u32_be().unwrap();
+                let msg = if msg_id == MSGID_SUGGEST_PIECE {
+                    Message::SuggestPiece(index)
+                } else {
+                    Message::AllowedFast(index)
+                };
+                Ok((msg, total_len))
+            }
+            MSGID_HAVE_ALL => {
+                check_msg_len!(0);
+                Ok((Message::HaveAll, total_len))
+            }
+            MSGID_HAVE_NONE => {
+                check_msg_len!(0);
+                Ok((Message::HaveNone, total_len))
+            }
             MSGID_BITFIELD => {
                 check_msg_len!(min 1);
                 // In practice, as bitfield is always (almost) the first message, it should be contiguous.
@@ -491,7 +545,7 @@ impl Message<'_> {
                     .ok_or(MessageDeserializeError::NeedContiguous)?;
                 Ok((Message::Bitfield(ByteBuf::from(data)), total_len))
             }
-            MSGID_REQUEST | MSGID_CANCEL => {
+            MSGID_REQUEST | MSGID_CANCEL | MSGID_REJECT_REQUEST => {
                 check_msg_len!(12);
                 const I32: usize = 4;
                 const I32_3: usize = I32 * 3;
@@ -501,10 +555,10 @@ impl Message<'_> {
                     begin: BE::read_u32(&req[I32..I32 * 2]),
                     length: BE::read_u32(&req[I32 * 2..I32 * 3]),
                 };
-                let req = if msg_id == MSGID_REQUEST {
-                    Message::Request(request)
-                } else {
-                    Message::Cancel(request)
+                let req = match msg_id {
+                    MSGID_REQUEST => Message::Request(request),
+                    MSGID_CANCEL => Message::Cancel(request),
+                    _ => Message::RejectRequest(request),
                 };
                 Ok((req, total_len))
             }
@@ -567,6 +621,9 @@ impl Message<'_> {
     }
 }
 
+/// qbt-rs: BEP 6 "reserved[7] |= 0x04".
+const FAST_EXTENSION_BIT: u64 = 0x04;
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct Handshake {
     pub reserved: u64,
@@ -581,6 +638,8 @@ impl Handshake {
         let mut reserved: u64 = 0;
         // supports extended messaging
         reserved |= 1 << 20;
+        // qbt-rs: supports the Fast extension (BEP 6): 0x04 in the last reserved byte.
+        reserved |= FAST_EXTENSION_BIT;
 
         Handshake {
             reserved,
@@ -611,6 +670,11 @@ impl Handshake {
 
     pub fn supports_extended(&self) -> bool {
         self.reserved.to_be_bytes()[5] & 0x10 > 0
+    }
+
+    /// qbt-rs: the peer supports the Fast extension (BEP 6).
+    pub fn supports_fast(&self) -> bool {
+        self.reserved & FAST_EXTENSION_BIT != 0
     }
 
     #[must_use]
@@ -678,6 +742,44 @@ mod tests {
         let (de, dlen) = Handshake::deserialize(&buf).unwrap();
         assert_eq!(dlen, len);
         assert_eq!(se, de);
+    }
+
+    #[test]
+    fn test_handshake_fast_bit() {
+        let mut buf = [0u8; 68];
+        let hs = Handshake::new(Id20::default(), Id20::default());
+        let _ = hs.serialize_unchecked_len(&mut buf);
+        // BEP 6: reserved[7] |= 0x04; BEP 10: reserved[5] |= 0x10.
+        assert_eq!(&buf[20..28], &[0, 0, 0, 0, 0, 0x10, 0, 0x04]);
+        let (de, _) = Handshake::deserialize(&buf).unwrap();
+        assert!(de.supports_fast() && de.supports_extended());
+        buf[27] = 0;
+        assert!(!Handshake::deserialize(&buf).unwrap().0.supports_fast());
+    }
+
+    #[test]
+    fn test_fast_extension_messages() {
+        let cases: Vec<(Message<'static>, Vec<u8>)> = vec![
+            (Message::SuggestPiece(7), vec![0, 0, 0, 5, 13, 0, 0, 0, 7]),
+            (Message::HaveAll, vec![0, 0, 0, 1, 14]),
+            (Message::HaveNone, vec![0, 0, 0, 1, 15]),
+            (
+                Message::RejectRequest(Request::new(1, 0x4000, 0x4000)),
+                vec![0, 0, 0, 13, 16, 0, 0, 0, 1, 0, 0, 0x40, 0, 0, 0, 0x40, 0],
+            ),
+            (Message::AllowedFast(0x0102), vec![0, 0, 0, 5, 17, 0, 0, 1, 2]),
+        ];
+        for (msg, wire) in cases {
+            let mut out = [0u8; 32];
+            let len = msg.serialize(&mut out, &Default::default).unwrap();
+            assert_eq!(&out[..len], &wire[..], "{msg:?}");
+            let (de, de_len) = Message::deserialize(&wire, &[]).unwrap();
+            assert_eq!(de_len, wire.len());
+            assert_eq!(format!("{de:?}"), format!("{msg:?}"));
+        }
+        // Wrong lengths are errors, not silently accepted.
+        assert!(Message::deserialize(&[0, 0, 0, 2, 14, 0], &[]).is_err());
+        assert!(Message::deserialize(&[0, 0, 0, 4, 17, 0, 0, 1], &[]).is_err());
     }
 
     #[test]

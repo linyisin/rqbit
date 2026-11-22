@@ -1,6 +1,9 @@
 // Modified by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-17:
 //   - test_acquire_follows_file_priorities (test only).
 //   - 2026-11-22: mark_chunk_downloaded() takes a validated ChunkInfo.
+//   - 2026-11-22: AcquireRequest::picking selects queued pieces rarest-first or sequentially
+//     (crate::piece_picker); without it the upstream file order is used.
+//   - 2026-11-22: release_piece_owned_by() (a peer rejected a request, Fast extension).
 // Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
 
 //! Coordinates piece download state by wrapping ChunkTracker with inflight piece tracking.
@@ -69,6 +72,9 @@ where
     pub peer_has_piece: P,
     /// Returns true if the piece can be stolen (e.g., not locked for writing).
     pub can_steal: S,
+    /// qbt-rs: how to choose among the queued pieces (rarest first / sequential, piece
+    /// priorities). `None` keeps the upstream order: file order, first and last piece first.
+    pub picking: Option<crate::piece_picker::PickOptions<'a>>,
 }
 
 /// Coordinates piece download state.
@@ -143,6 +149,22 @@ impl PieceTracker {
             {
                 return self.reserve_piece(piece, req.peer);
             }
+        }
+
+        // qbt-rs: libtorrent-style picking among the queued pieces the peer has.
+        if let Some(picking) = &req.picking {
+            let candidates = self
+                .chunks
+                .iter_queued_piece_ids()
+                .filter(|p| !self.inflight.contains_key(p))
+                .filter(|p| (req.peer_has_piece)(*p));
+            if let Some(piece) = crate::piece_picker::pick(candidates, picking) {
+                return self.reserve_piece(piece, req.peer);
+            }
+            if let Some(result) = self.try_steal(&req, 3.0) {
+                return result;
+            }
+            return AcquireResult::NoneAvailable;
         }
 
         // Then check naturally ordered queued pieces
@@ -261,6 +283,16 @@ impl PieceTracker {
             self.chunks.mark_piece_broken_if_not_have(piece);
         }
         count
+    }
+
+    /// qbt-rs: gives one piece back to the queue if `peer` is downloading it.
+    pub fn release_piece_owned_by(&mut self, piece: ValidPieceIndex, peer: PeerHandle) -> bool {
+        if self.inflight.get(&piece).is_none_or(|i| i.peer != peer) {
+            return false;
+        }
+        self.inflight.remove(&piece);
+        self.chunks.mark_piece_broken_if_not_have(piece);
+        true
     }
 
     // === QUERIES ===
@@ -408,6 +440,7 @@ mod tests {
                 peer: peer(1),
                 peer_avg_time: None,
                 priority_pieces: std::iter::empty(),
+                picking: None,
                 file_priorities: &file_priorities,
                 file_infos: &file_infos,
                 peer_has_piece: |_| true,
@@ -439,6 +472,7 @@ mod tests {
             peer: peer(1),
             peer_avg_time: None,
             priority_pieces: std::iter::empty(),
+            picking: None,
             file_priorities: &file_priorities,
             file_infos: &file_infos,
             peer_has_piece: |_| true, // Peer has all pieces
@@ -472,6 +506,7 @@ mod tests {
             peer: peer(1),
             peer_avg_time: None,
             priority_pieces: std::iter::empty(),
+            picking: None,
             file_priorities: &file_priorities,
             file_infos: &file_infos,
             peer_has_piece: |p| p.get() >= 2,
@@ -500,6 +535,7 @@ mod tests {
             peer: peer(1),
             peer_avg_time: None,
             priority_pieces: std::iter::empty(),
+            picking: None,
             file_priorities: &file_priorities,
             file_infos: &file_infos,
             peer_has_piece: |_| true,
@@ -533,6 +569,7 @@ mod tests {
             peer: peer(1),
             peer_avg_time: None,
             priority_pieces: std::iter::empty(),
+            picking: None,
             file_priorities: &file_priorities,
             file_infos: &file_infos,
             peer_has_piece: |_| true,
@@ -561,6 +598,7 @@ mod tests {
             peer: peer(2),
             peer_avg_time: None,
             priority_pieces: std::iter::empty(),
+            picking: None,
             file_priorities: &file_priorities,
             file_infos: &file_infos,
             peer_has_piece: |p| p == piece, // Only has the failed piece
@@ -590,6 +628,7 @@ mod tests {
             peer: peer_a,
             peer_avg_time: None,
             priority_pieces: std::iter::empty(),
+            picking: None,
             file_priorities: &file_priorities,
             file_infos: &file_infos,
             peer_has_piece: |_| true,
@@ -602,6 +641,7 @@ mod tests {
             peer: peer_a,
             peer_avg_time: None,
             priority_pieces: std::iter::empty(),
+            picking: None,
             file_priorities: &file_priorities,
             file_infos: &file_infos,
             peer_has_piece: |_| true,
@@ -616,6 +656,7 @@ mod tests {
             peer: peer_b,
             peer_avg_time: None,
             priority_pieces: std::iter::empty(),
+            picking: None,
             file_priorities: &file_priorities,
             file_infos: &file_infos,
             peer_has_piece: |_| true,
@@ -655,6 +696,7 @@ mod tests {
             peer: peer(1),
             peer_avg_time: None,
             priority_pieces: std::iter::empty(),
+            picking: None,
             file_priorities: &file_priorities,
             file_infos: &file_infos,
             peer_has_piece: |_| true,
@@ -664,6 +706,7 @@ mod tests {
             peer: peer(1),
             peer_avg_time: None,
             priority_pieces: std::iter::empty(),
+            picking: None,
             file_priorities: &file_priorities,
             file_infos: &file_infos,
             peer_has_piece: |_| true,
@@ -681,6 +724,7 @@ mod tests {
             peer: peer(2),
             peer_avg_time: None,
             priority_pieces: std::iter::empty(),
+            picking: None,
             file_priorities: &file_priorities,
             file_infos: &file_infos,
             peer_has_piece: |_| true,
@@ -723,6 +767,7 @@ mod tests {
             file_infos: &file_infos,
             peer_has_piece: |_| true,
             can_steal: |_| true,
+            picking: None,
         });
 
         // Should get piece 3 (first priority piece)
@@ -745,6 +790,7 @@ mod tests {
             peer: peer(1),
             peer_avg_time: None,
             priority_pieces: std::iter::empty(),
+            picking: None,
             file_priorities: &file_priorities,
             file_infos: &file_infos,
             peer_has_piece: |_| false, // Peer has nothing
@@ -793,6 +839,7 @@ mod tests {
             peer: peer_a,
             peer_avg_time: None,
             priority_pieces: std::iter::empty(),
+            picking: None,
             file_priorities: &file_priorities,
             file_infos: &file_infos,
             peer_has_piece: |_| true,
@@ -809,6 +856,7 @@ mod tests {
             peer: peer_a,
             peer_avg_time: None,
             priority_pieces: std::iter::empty(),
+            picking: None,
             file_priorities: &file_priorities,
             file_infos: &file_infos,
             peer_has_piece: |_| true,
@@ -831,6 +879,7 @@ mod tests {
             peer: peer_b,
             peer_avg_time: Some(Duration::from_millis(1)),
             priority_pieces: std::iter::empty(),
+            picking: None,
             file_priorities: &file_priorities,
             file_infos: &file_infos,
             peer_has_piece: |p| p.get() == 4, // Peer B only has piece 4

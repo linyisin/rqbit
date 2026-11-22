@@ -50,8 +50,10 @@ pub struct PeerFlags {
     pub remote_choked: bool,
     /// The peer is interested in us.
     pub remote_interested: bool,
-    /// We choke the peer (librqbit unchokes every peer right after the handshake).
+    /// We choke the peer (qbt-rs: decided by crate::choker).
     pub choked: bool,
+    /// qbt-rs: we unchoke the peer in an optimistic slot.
+    pub optimistic: bool,
     pub incoming: bool,
     pub rc4_encrypted: bool,
     pub plaintext_encrypted: bool,
@@ -98,7 +100,8 @@ impl From<&Peer> for PeerStats {
                 interesting: bits & conn_flags::INTERESTING != 0,
                 remote_choked: bits & conn_flags::REMOTE_UNCHOKED == 0,
                 remote_interested: live.is_some_and(|l| l.peer_interested),
-                choked: live.is_none(),
+                choked: bits & conn_flags::LOCAL_UNCHOKED == 0,
+                optimistic: bits & conn_flags::OPTIMISTIC != 0,
                 incoming: bits & conn_flags::INCOMING != 0,
                 rc4_encrypted: bits & conn_flags::RC4 != 0,
                 plaintext_encrypted: bits & conn_flags::PLAINTEXT_ENCRYPTED != 0,

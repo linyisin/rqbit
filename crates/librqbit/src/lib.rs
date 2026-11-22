@@ -5,6 +5,7 @@
 //   - 2026-11-21: BitTorrent v2 (BEP 52): V2_PIECE_LAYERS_MISSING and merkle re-exports, e2e test
 //     module.
 //   - 2026-11-22: peer_source, external_ip and torrent_creator modules; PeerFlags re-export.
+//   - 2026-11-22: piece_picker, choker, fast_extension (BEP 6) and natpmp (RFC 6886) modules.
 // Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
 
 //!
@@ -54,10 +55,12 @@ pub mod api;
 mod api_error;
 mod bitv;
 mod bitv_factory;
+mod choker;
 mod chunk_tracker;
 mod create_torrent_file;
 mod dht_utils;
 mod error;
+mod fast_extension;
 pub mod file_info;
 mod file_ops;
 #[cfg(feature = "http-api")]
@@ -69,6 +72,7 @@ pub mod http_api_types;
 mod ip_ranges;
 pub mod limits;
 mod listen;
+mod natpmp;
 mod merge_streams;
 pub mod mse;
 pub mod web_seed;
@@ -77,6 +81,7 @@ mod peer_info_reader;
 pub mod peer_source;
 pub mod external_ip;
 pub mod torrent_creator;
+mod piece_picker;
 mod piece_tracker;
 mod read_buf;
 mod session;

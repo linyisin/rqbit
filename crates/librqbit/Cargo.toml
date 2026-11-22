@@ -112,6 +112,8 @@ librqbit-dualstack-sockets = { workspace = true, features = ["axum"] }
 socket2.workspace = true
 nix = { workspace = true, features = ["uio"] }
 thiserror.workspace = true
+# qbt-rs (2026-11-22): the default gateway, for NAT-PMP port mapping (src/natpmp.rs).
+netdev = { version = "0.47", default-features = false, features = ["gateway"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = ["Win32", "Win32_System", "Win32_System_IO", "Win32_System_Ioctl"] }

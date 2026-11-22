@@ -1,3 +1,7 @@
+// Modified by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-22: piece availability
+// (PeerStates::availability), kept in sync with live peers' bitfields.
+// Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
+
 use std::{collections::HashSet, net::SocketAddr, sync::Arc};
 
 use dashmap::DashMap;
@@ -23,6 +27,9 @@ pub(crate) struct PeerStates {
     pub live_outgoing_peers: RwLock<HashSet<PeerHandle>>,
     pub stats: AggregatePeerStatsAtomic,
     pub states: DashMap<PeerHandle, Peer>,
+    /// qbt-rs: how many live peers have each piece (rarest-first picking, availability).
+    /// Kept in sync on every change of a live peer's bitfield and on live state transitions.
+    pub availability: crate::piece_picker::PieceAvailability,
 }
 
 impl Drop for PeerStates {
@@ -118,6 +125,8 @@ impl PeerStates {
         total_pieces: usize,
     ) -> Option<()> {
         self.with_live_mut(handle, "update_bitfield", |live| {
+            self.availability.remove(&live.bitfield);
+            self.availability.add(&bitfield);
             live.bitfield = bitfield;
             self.update_seeder_flag(live, total_pieces);
         })
@@ -203,6 +212,7 @@ mod tests {
             live_outgoing_peers: Default::default(),
             stats: Default::default(),
             states: Default::default(),
+            availability: Default::default(),
         }
     }
 
