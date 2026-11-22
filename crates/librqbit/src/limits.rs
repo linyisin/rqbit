@@ -1,3 +1,8 @@
+// Modified by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-22:
+//   - Limit::acquire() takes amounts bigger than the limiter's burst (one second's worth) in
+//     several steps, so limits below the 16 KiB chunk size no longer fail every request.
+// Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
+
 use arc_swap::ArcSwapOption;
 use governor::DefaultDirectRateLimiter as RateLimiter;
 use governor::Quota;
@@ -34,7 +39,15 @@ impl Limit {
     async fn acquire(&self, size: NonZeroU32) -> crate::Result<()> {
         let lim = self.limiter.load().clone();
         if let Some(rl) = lim.as_ref() {
-            rl.until_n_ready(size).await?;
+            // qbt-rs: governor refuses a request bigger than the burst size (= bps) outright.
+            let burst = NonZeroU32::new(self.current_bps.load(std::sync::atomic::Ordering::Relaxed))
+                .unwrap_or(size);
+            let mut left = size.get();
+            while left > 0 {
+                let step = left.min(burst.get());
+                rl.until_n_ready(NonZeroU32::new(step).unwrap()).await?;
+                left -= step;
+            }
         }
         Ok(())
     }
@@ -95,5 +108,26 @@ impl Limits {
             upload_bps: self.get_upload_bps(),
             download_bps: self.get_download_bps(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // qbt-rs: a limit below one chunk used to fail with governor's InsufficientCapacity.
+    #[tokio::test]
+    async fn acquire_more_than_burst() {
+        let limits = Limits::new(LimitsConfig {
+            upload_bps: None,
+            download_bps: NonZeroU32::new(8000),
+        });
+        let start = std::time::Instant::now();
+        limits
+            .prepare_for_download(NonZeroU32::new(16000).unwrap())
+            .await
+            .unwrap();
+        assert!(start.elapsed() >= std::time::Duration::from_millis(900));
+        assert_eq!(limits.get_download_bps(), NonZeroU32::new(8000));
     }
 }

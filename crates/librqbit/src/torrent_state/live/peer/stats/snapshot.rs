@@ -1,3 +1,7 @@
+// Modified by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-22: PeerStats::flags and
+// pieces_have (qBittorrent's peer flags and per-peer progress).
+// Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
+
 use std::{collections::HashMap, sync::atomic::Ordering};
 
 use serde::{Deserialize, Serialize};
@@ -29,6 +33,32 @@ pub struct PeerStats {
     pub state: &'static str,
     pub conn_kind: Option<ConnectionKind>,
     pub client_name: Option<String>,
+    /// qbt-rs: choke/interest/direction/encryption/source of the peer.
+    pub flags: PeerFlags,
+    /// qbt-rs: how many pieces the peer has (from its bitfield and haves); None until known.
+    pub pieces_have: Option<u32>,
+    /// qbt-rs: of the pieces we still miss, the share the peer has (qBittorrent's "relevance").
+    pub relevance: Option<f64>,
+}
+
+/// qbt-rs: what qBittorrent shows as peer flags (D d U u K ? I E e H X L).
+#[derive(Serialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PeerFlags {
+    /// We are interested in the peer.
+    pub interesting: bool,
+    /// The peer chokes us.
+    pub remote_choked: bool,
+    /// The peer is interested in us.
+    pub remote_interested: bool,
+    /// We choke the peer (librqbit unchokes every peer right after the handshake).
+    pub choked: bool,
+    pub incoming: bool,
+    pub rc4_encrypted: bool,
+    pub plaintext_encrypted: bool,
+    pub from_tracker: bool,
+    pub from_dht: bool,
+    pub from_pex: bool,
+    pub from_lsd: bool,
 }
 
 impl From<&super::atomic::PeerCountersAtomic> for PeerCounters {
@@ -56,8 +86,28 @@ impl From<&super::atomic::PeerCountersAtomic> for PeerCounters {
 
 impl From<&Peer> for PeerStats {
     fn from(peer: &Peer) -> Self {
+        use super::atomic::conn_flags;
         let state = peer.get_state();
+        let bits = peer.stats.counters.conn_flags.load(Ordering::Relaxed);
+        let live = match state {
+            PeerState::Live(l) => Some(l),
+            _ => None,
+        };
         Self {
+            flags: PeerFlags {
+                interesting: bits & conn_flags::INTERESTING != 0,
+                remote_choked: bits & conn_flags::REMOTE_UNCHOKED == 0,
+                remote_interested: live.is_some_and(|l| l.peer_interested),
+                choked: live.is_none(),
+                incoming: bits & conn_flags::INCOMING != 0,
+                rc4_encrypted: bits & conn_flags::RC4 != 0,
+                plaintext_encrypted: bits & conn_flags::PLAINTEXT_ENCRYPTED != 0,
+                ..Default::default()
+            },
+            pieces_have: live
+                .filter(|l| !l.bitfield.is_empty())
+                .map(|l| u32::try_from(l.bitfield.count_ones()).unwrap_or(u32::MAX)),
+            relevance: None,
             counters: peer.stats.counters.as_ref().into(),
             state: state.name(),
             conn_kind: match state {

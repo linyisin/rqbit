@@ -1,5 +1,7 @@
 // Added by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-20: HTTP/FTP web seeds
 // ("GetRight style", BEP 19). Licensed under Apache-2.0 like the rest of rqbit.
+// 2026-11-22: the list can change at any time (WebSeeds::add / remove, qBittorrent's "Add web
+// seed" / "Remove web seed"); each seed has a stable id for its pseudo address.
 //
 // Spec: https://www.bittorrent.org/beps/bep_0019.html
 //
@@ -23,7 +25,10 @@
 
 use std::{
     net::{IpAddr, Ipv6Addr, SocketAddr},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
 };
 
 use bencode::BencodeValue;
@@ -146,9 +151,13 @@ pub struct WebSeedStatus {
 
 #[derive(Debug)]
 pub(crate) struct WebSeed {
+    /// Stable id (for `pseudo_addr`); never reused within a torrent.
+    pub(crate) id: usize,
     pub(crate) url: url::Url,
     pub(crate) downloaded: AtomicU64,
     state: parking_lot::Mutex<(bool, Option<String>)>,
+    /// Cancelled when the web seed is removed; its task then stops.
+    pub(crate) removed: tokio_util::sync::CancellationToken,
 }
 
 impl WebSeed {
@@ -165,33 +174,79 @@ impl WebSeed {
     }
 }
 
+/// At most this many web seeds download at the same time (libtorrent max_web_seed_connections).
+pub(crate) const MAX_CONNECTIONS: usize = 3;
+
 /// The web seeds of one torrent.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct WebSeeds {
-    pub(crate) seeds: Vec<WebSeed>,
+    seeds: parking_lot::RwLock<Vec<Arc<WebSeed>>>,
+    next_id: AtomicUsize,
+    /// Shared by all web seed tasks of the torrent, also the ones added later.
+    pub(crate) slots: Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for WebSeeds {
+    fn default() -> Self {
+        WebSeeds::new([])
+    }
 }
 
 impl WebSeeds {
     pub fn new(urls: impl IntoIterator<Item = url::Url>) -> Self {
-        let mut seeds: Vec<WebSeed> = Vec::new();
+        let seeds = WebSeeds {
+            seeds: Default::default(),
+            next_id: AtomicUsize::new(0),
+            slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
+        };
         for url in urls {
-            if seeds.iter().all(|s| s.url != url) {
-                seeds.push(WebSeed {
-                    url,
-                    downloaded: AtomicU64::new(0),
-                    state: parking_lot::Mutex::new((false, None)),
-                });
-            }
+            seeds.add(url);
         }
-        WebSeeds { seeds }
+        seeds
+    }
+
+    /// Adds a web seed; `None` if it is already there.
+    pub(crate) fn add(&self, url: url::Url) -> Option<Arc<WebSeed>> {
+        let mut seeds = self.seeds.write();
+        if seeds.iter().any(|s| s.url == url) {
+            return None;
+        }
+        let seed = Arc::new(WebSeed {
+            id: self.next_id.fetch_add(1, Ordering::Relaxed),
+            url,
+            downloaded: AtomicU64::new(0),
+            state: parking_lot::Mutex::new((false, None)),
+            removed: Default::default(),
+        });
+        seeds.push(seed.clone());
+        Some(seed)
+    }
+
+    /// Removes a web seed (stopping its download); false if there was no such web seed.
+    pub(crate) fn remove(&self, url: &url::Url) -> bool {
+        let mut seeds = self.seeds.write();
+        let Some(index) = seeds.iter().position(|s| &s.url == url) else {
+            return false;
+        };
+        seeds.remove(index).removed.cancel();
+        true
+    }
+
+    pub(crate) fn list(&self) -> Vec<Arc<WebSeed>> {
+        self.seeds.read().clone()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.seeds.is_empty()
+        self.seeds.read().is_empty()
+    }
+
+    pub fn urls(&self) -> Vec<url::Url> {
+        self.seeds.read().iter().map(|s| s.url.clone()).collect()
     }
 
     pub fn statuses(&self) -> Vec<WebSeedStatus> {
         self.seeds
+            .read()
             .iter()
             .map(|s| {
                 let (active, error) = s.state.lock().clone();
@@ -295,15 +350,24 @@ mod tests {
     #[test]
     fn statuses() {
         let seeds = WebSeeds::new([url("http://a/"), url("http://a/"), url("http://b/")]);
-        assert_eq!(seeds.seeds.len(), 2);
-        seeds.seeds[0].set_active(true);
-        seeds.seeds[0].downloaded.fetch_add(5, Ordering::Relaxed);
-        seeds.seeds[1].set_error("HTTP 404".into());
+        let list = seeds.list();
+        assert_eq!(list.len(), 2);
+        list[0].set_active(true);
+        list[0].downloaded.fetch_add(5, Ordering::Relaxed);
+        list[1].set_error("HTTP 404".into());
         let s = seeds.statuses();
         assert_eq!((s[0].active, s[0].downloaded_bytes, s[0].error.clone()), (true, 5, None));
         assert_eq!((s[1].active, s[1].error.as_deref()), (false, Some("HTTP 404")));
         // Becoming active again clears the error.
-        seeds.seeds[1].set_active(true);
+        list[1].set_active(true);
         assert_eq!(seeds.statuses()[1].error, None);
+        // Adding and removing (ids are never reused).
+        assert!(seeds.add(url("http://a/")).is_none(), "already there");
+        assert!(seeds.remove(&url("http://a/")));
+        assert!(list[0].removed.is_cancelled());
+        assert!(!seeds.remove(&url("http://a/")));
+        let c = seeds.add(url("http://c/")).unwrap();
+        assert_eq!(c.id, 2);
+        assert_eq!(seeds.urls(), vec![url("http://b/"), url("http://c/")]);
     }
 }

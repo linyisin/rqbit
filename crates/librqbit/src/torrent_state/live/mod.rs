@@ -5,6 +5,15 @@
 //     module level so web seeds can share it.
 //   - 2026-11-21: answers BitTorrent v2 hash requests (BEP 52, on_hash_request), and accepts
 //     the shorter requests v2 peers send for the end of a file (on_download_request).
+//   - 2026-11-22: uses the per-torrent limiter kept in ManagedTorrentShared, so limits can be
+//     changed while live and survive pause/resume.
+//   - 2026-11-22: records per-connection flags (interest, choke, direction, encryption) and peer
+//     sources (PEX here; tracker/DHT/LSD in Session::make_peer_rx) for qBittorrent's peer flags.
+//   - 2026-11-22: counts the "yourip" of extended handshakes (Session::external_ip).
+//   - 2026-11-22: incoming peers are answered with the info hash they used (hybrid v2 hash).
+//   - 2026-11-22: v2-only torrents: requests stop at the end of each file's data (BEP 52 peers
+//     never send padding; libtorrent's piece_size_for_req), padding-only blocks are filled in
+//     locally, and the shorter answers are accepted (on_received_piece).
 // Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
 
 // The main logic of rqbit is here - connecting to peers, reading and writing messages
@@ -224,7 +233,7 @@ pub struct TorrentStateLive {
         tokio::sync::mpsc::UnboundedSender<WriterRequest>,
         ChunkInfo,
     )>,
-    ratelimits: Limits,
+    ratelimits: Arc<Limits>,
 }
 
 impl TorrentStateLive {
@@ -264,7 +273,7 @@ impl TorrentStateLive {
             tokio::sync::mpsc::UnboundedSender<WriterRequest>,
             ChunkInfo,
         )>();
-        let ratelimits = Limits::new(paused.shared.options.ratelimits);
+        let ratelimits = paused.shared.ratelimits.clone();
 
         let state = Arc::new(TorrentStateLive {
             shared: paused.shared.clone(),
@@ -483,6 +492,16 @@ impl TorrentStateLive {
         rx: PeerRx,
         permit: OwnedSemaphorePermit,
     ) -> crate::Result<()> {
+        {
+            use super::live::peer::stats::atomic::conn_flags;
+            let mut bits = conn_flags::INCOMING;
+            match checked_peer.encrypted {
+                Some(true) => bits |= conn_flags::RC4,
+                Some(false) => bits |= conn_flags::PLAINTEXT_ENCRYPTED,
+                None => {}
+            }
+            counters.conn_flags.store(bits, Ordering::Relaxed);
+        }
         let handler = PeerHandler {
             addr: checked_peer.addr,
             incoming: true,
@@ -501,9 +520,10 @@ impl TorrentStateLive {
             read_write_timeout: self.shared.options.peer_read_write_timeout,
             ..Default::default()
         };
+        // qbt-rs: answer with the info hash the peer used (v1, or a hybrid torrent's v2 hash).
         let peer_connection = PeerConnection::new(
             checked_peer.addr,
-            self.shared.info_hash,
+            checked_peer.handshake.info_hash,
             self.shared.peer_id,
             &handler,
             Some(options),
@@ -547,6 +567,7 @@ impl TorrentStateLive {
             .with_peer(addr, |p| p.stats.counters.clone())
             .ok_or(Error::BugPeerNotFound)?;
 
+        counters.conn_flags.store(0, Ordering::Relaxed);
         let handler = PeerHandler {
             addr,
             incoming: false,
@@ -758,13 +779,45 @@ impl TorrentStateLive {
     }
 
     pub fn per_peer_stats_snapshot(&self, filter: PeerStatsFilter) -> PeerStatsSnapshot {
+        // qbt-rs: our own pieces, for each peer's relevance.
+        let total = self.lengths.total_pieces() as usize;
+        let have: Option<BF> = self
+            .lock_read("per_peer_stats_snapshot")
+            .get_chunks()
+            .ok()
+            .and_then(|c| c.get_have_pieces().as_slice().get(..total).map(|s| s.to_bitvec().into_boxed_bitslice()));
         PeerStatsSnapshot {
             peers: self
                 .peers
                 .states
                 .iter()
                 .filter(|e| filter.state.matches(e.value().get_state()))
-                .map(|e| (e.key().to_string(), e.value().into()))
+                .map(|e| {
+                    let mut stats: peer::stats::snapshot::PeerStats = e.value().into();
+                    if let (Some(have), PeerState::Live(l)) = (&have, e.value().get_state())
+                        && !l.bitfield.is_empty()
+                    {
+                        let missing = have.count_zeros();
+                        stats.relevance = Some(if missing == 0 {
+                            0.0
+                        } else {
+                            let useful = have
+                                .iter_zeros()
+                                .filter(|i| l.bitfield.get(*i).is_some_and(|b| *b))
+                                .count();
+                            useful as f64 / missing as f64
+                        });
+                    }
+                    let sources = self.shared.peer_sources.get(e.key());
+                    {
+                        use crate::peer_source::*;
+                        stats.flags.from_tracker = sources & FROM_TRACKER != 0;
+                        stats.flags.from_dht = sources & FROM_DHT != 0;
+                        stats.flags.from_pex = sources & FROM_PEX != 0;
+                        stats.flags.from_lsd = sources & FROM_LSD != 0;
+                    }
+                    (e.key().to_string(), stats)
+                })
                 .collect(),
         }
     }
@@ -1104,7 +1157,7 @@ fn write_to_disk(
 
     let full_piece_download_time = {
         let mut g = state.lock_write("mark_chunk_downloaded");
-        let chunk_marking_result = g.get_pieces_mut()?.mark_chunk_downloaded(piece);
+        let chunk_marking_result = g.get_pieces_mut()?.mark_chunk_downloaded(chunk_info);
         trace!(?piece, chunk_marking_result=?chunk_marking_result);
 
         match chunk_marking_result {
@@ -1229,6 +1282,14 @@ struct PeerHandler {
 }
 
 impl PeerConnectionHandler for &'_ PeerHandler {
+    fn on_encrypted(&self, rc4: bool) {
+        use peer::stats::atomic::conn_flags;
+        self.counters.set_conn_flag(
+            if rc4 { conn_flags::RC4 } else { conn_flags::PLAINTEXT_ENCRYPTED },
+            true,
+        );
+    }
+
     fn on_connected(&self, connection_time: Duration) {
         self.counters
             .outgoing_connections
@@ -1352,6 +1413,10 @@ impl PeerConnectionHandler for &'_ PeerHandler {
     }
 
     fn on_extended_handshake(&self, hs: &ExtendedHandshake<ByteBuf>) -> anyhow::Result<()> {
+        // qbt-rs: "yourip" is how the peer sees us (for the external IP in the status bar).
+        if let (Some(yourip), Some(session)) = (hs.yourip, self.state.shared.session.upgrade()) {
+            session.external_ip.vote(self.addr.ip(), yourip.0);
+        }
         if let Some(client_name) = hs.v.as_ref().and_then(format_peer_client_name) {
             self.state
                 .peers
@@ -1843,6 +1908,8 @@ impl PeerHandler {
                     .ok()
                     .ok_or(Error::PeerTaskDead)?;
                     current = new_value;
+                    h.counters
+                        .set_conn_flag(peer::stats::atomic::conn_flags::INTERESTING, new_value);
                 }
                 Ok(())
             }
@@ -1900,7 +1967,39 @@ impl PeerHandler {
                 }
             };
 
-            for chunk in self.state.lengths.iter_chunk_infos(next) {
+            // qbt-rs: BitTorrent v2: the data of this piece may end before the piece does.
+            let v2_data_len = self
+                .state
+                .metadata
+                .info
+                .v2_hashes()
+                .and_then(|h| h.piece_data_len(next.get()));
+            for mut chunk in self.state.lengths.iter_chunk_infos(next) {
+                if let Some(data_len) = v2_data_len {
+                    if chunk.offset >= data_len {
+                        // Only padding: nobody sends it, it is all zeros.
+                        let zeros = vec![0u8; chunk.size as usize];
+                        let message =
+                            Piece::<ByteBuf<'_>>::from_data(next.get(), chunk.offset, &zeros);
+                        self.state
+                            .shared
+                            .spawner
+                            .block_in_place_with_semaphore(|| {
+                                write_to_disk(
+                                    &self.state,
+                                    self.addr,
+                                    &self.counters,
+                                    &message,
+                                    &chunk,
+                                )
+                            })
+                            .await
+                            .context("error filling in v2 padding")
+                            .map_err(Error::Anyhow)?;
+                        continue;
+                    }
+                    chunk.size = chunk.size.min(data_len - chunk.offset);
+                }
                 let request = Request {
                     index: next.get(),
                     begin: chunk.offset,
@@ -1963,6 +2062,8 @@ impl PeerHandler {
 
     fn on_i_am_choked(&self) {
         self.lock_flow_control("i_am_choked = true").i_am_choked = true;
+        self.counters
+            .set_conn_flag(peer::stats::atomic::conn_flags::REMOTE_UNCHOKED, false);
         self.notify_request_slots_changed();
     }
 
@@ -1974,6 +2075,8 @@ impl PeerHandler {
     fn on_i_am_unchoked(&self) {
         trace!("we are unchoked");
         self.lock_flow_control("i_am_choked = false").i_am_choked = false;
+        self.counters
+            .set_conn_flag(peer::stats::atomic::conn_flags::REMOTE_UNCHOKED, true);
         self.notify_request_slots_changed();
     }
 
@@ -1983,11 +2086,27 @@ impl PeerHandler {
             .lengths
             .validate_piece_index(piece.index)
             .with_context(|| format!("peer sent an invalid piece {}", piece.index))?;
-        let chunk_info = match self.state.lengths.chunk_info_from_received_data(
-            piece_index,
-            piece.begin,
-            piece.len().try_into().context("bug")?,
-        ) {
+        let length: u32 = piece.len().try_into().context("bug")?;
+        // qbt-rs: BitTorrent v2: the last block of a file comes without its padding.
+        let v2_data_len = self
+            .state
+            .metadata
+            .info
+            .v2_hashes()
+            .and_then(|h| h.piece_data_len(piece_index.get()));
+        let chunk_info = match v2_data_len {
+            Some(data_len) => self.state.lengths.chunk_info_from_received_data_v2(
+                piece_index,
+                piece.begin,
+                length,
+                data_len,
+            ),
+            None => self
+                .state
+                .lengths
+                .chunk_info_from_received_data(piece_index, piece.begin, length),
+        };
+        let chunk_info = match chunk_info {
             Some(i) => i,
             None => {
                 anyhow::bail!("peer sent us an invalid piece {:?}", piece,);
@@ -2113,6 +2232,10 @@ impl PeerHandler {
         msg.dropped_peers()
             .chain(msg.added_peers())
             .for_each(|peer| {
+                self.state
+                    .shared
+                    .peer_sources
+                    .mark(peer.addr, crate::peer_source::FROM_PEX);
                 self.state
                     .add_peer_if_not_seen(peer.addr)
                     .map_err(|error| {

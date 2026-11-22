@@ -1,5 +1,6 @@
 // Modified by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-17:
 //   - test_acquire_follows_file_priorities (test only).
+//   - 2026-11-22: mark_chunk_downloaded() takes a validated ChunkInfo.
 // Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
 
 //! Coordinates piece download state by wrapping ChunkTracker with inflight piece tracking.
@@ -18,9 +19,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use buffers::ByteBuf;
-use librqbit_core::lengths::ValidPieceIndex;
-use peer_binary_protocol::Piece;
+use librqbit_core::lengths::{ChunkInfo, ValidPieceIndex};
 
 use crate::{
     chunk_tracker::{ChunkMarkingResult, ChunkTracker},
@@ -286,11 +285,8 @@ impl PieceTracker {
     // === PASS-THROUGH METHODS ===
 
     /// Mark a chunk as downloaded. Returns the result indicating if the piece is complete.
-    pub fn mark_chunk_downloaded(
-        &mut self,
-        piece: &Piece<ByteBuf<'_>>,
-    ) -> Option<ChunkMarkingResult> {
-        self.chunks.mark_chunk_downloaded(piece)
+    pub fn mark_chunk_downloaded(&mut self, chunk_info: &ChunkInfo) -> Option<ChunkMarkingResult> {
+        self.chunks.mark_chunk_downloaded(chunk_info)
     }
 
     /// Update which files are selected for download.

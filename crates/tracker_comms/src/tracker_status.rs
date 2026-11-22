@@ -1,6 +1,8 @@
 // Added by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-17: per-tracker status
 // (qBittorrent's tracker list) and scrape support. Licensed under Apache-2.0 like the rest of
 // rqbit.
+// 2026-11-22: TrackerStatuses also carries the "reannounce now" signal (qBittorrent's
+// "Force reannounce", libtorrent force_reannounce with ignore_min_interval).
 
 use std::{
     collections::HashMap,
@@ -55,34 +57,57 @@ pub struct TrackerStatus {
 }
 
 /// Shared, cheaply clonable status table for one torrent, keyed by tracker URL.
-#[derive(Clone, Default)]
-pub struct TrackerStatuses(Arc<RwLock<HashMap<String, TrackerStatus>>>);
+#[derive(Clone)]
+pub struct TrackerStatuses {
+    map: Arc<RwLock<HashMap<String, TrackerStatus>>>,
+    /// Bumped by [`TrackerStatuses::reannounce`]; tracker monitors wait on it while sleeping.
+    reannounce: Arc<tokio::sync::watch::Sender<u64>>,
+}
+
+impl Default for TrackerStatuses {
+    fn default() -> Self {
+        Self {
+            map: Default::default(),
+            reannounce: Arc::new(tokio::sync::watch::channel(0).0),
+        }
+    }
+}
 
 impl std::fmt::Debug for TrackerStatuses {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_map().entries(self.0.read().iter()).finish()
+        f.debug_map().entries(self.map.read().iter()).finish()
     }
 }
 
 impl TrackerStatuses {
+    /// Ask every tracker to announce now, ignoring the tracker's (min) interval.
+    pub fn reannounce(&self) {
+        self.reannounce.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// A receiver that sees the next [`TrackerStatuses::reannounce`] call.
+    pub fn reannounce_signal(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.reannounce.subscribe()
+    }
+
     /// All known trackers with their status.
     pub fn snapshot(&self) -> Vec<(String, TrackerStatus)> {
-        let mut v: Vec<_> = self.0.read().iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let mut v: Vec<_> = self.map.read().iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         v.sort_by(|a, b| a.0.cmp(&b.0));
         v
     }
 
     pub fn get(&self, url: &Url) -> Option<TrackerStatus> {
-        self.0.read().get(url.as_str()).cloned()
+        self.map.read().get(url.as_str()).cloned()
     }
 
     /// Make sure every tracker shows up, even before its first announce.
     pub fn register(&self, url: &Url) {
-        self.0.write().entry(url.to_string()).or_default();
+        self.map.write().entry(url.to_string()).or_default();
     }
 
     pub fn update(&self, url: &Url, f: impl FnOnce(&mut TrackerStatus)) {
-        f(self.0.write().entry(url.to_string()).or_default());
+        f(self.map.write().entry(url.to_string()).or_default());
     }
 }
 
@@ -178,6 +203,18 @@ mod tests {
         assert!(parse_http_scrape(&body, &Id20::new([8u8; 20])).is_err());
         assert!(parse_http_scrape(b"d14:failure reason4:nopee", &hash).is_err());
         assert!(parse_http_scrape(b"le", &hash).is_err());
+    }
+
+    #[tokio::test]
+    async fn reannounce_wakes_waiters() {
+        let s = TrackerStatuses::default();
+        let mut rx = s.reannounce_signal();
+        let s2 = s.clone();
+        tokio::spawn(async move { s2.reannounce() });
+        tokio::time::timeout(Duration::from_secs(5), rx.changed())
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[test]

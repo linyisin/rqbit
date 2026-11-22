@@ -1,6 +1,8 @@
 // Modified by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-17:
 //   - record per-tracker status (TrackerStatuses) around every announce, and scrape (HTTP BEP 48,
 //     UDP BEP 15) after a successful announce at most every 30 minutes.
+//   - 2026-11-22: TrackerStatuses::reannounce() cuts the wait short (also the retry backoff), so
+//     every tracker announces again right away.
 // Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
 
 use std::collections::HashSet;
@@ -289,7 +291,8 @@ impl TrackerComms {
         let mut event = Some(tracker_comms_http::TrackerRequestEvent::Started);
 
         loop {
-            let interval = (|| self.tracker_one_request_http(&tracker_url, event))
+            let mut reannounce = self.statuses.reannounce_signal();
+            let request = (|| self.tracker_one_request_http(&tracker_url, event))
                 .retry(
                     ExponentialBuilder::new()
                         .without_max_times()
@@ -304,8 +307,12 @@ impl TrackerComms {
                         s.next_announce = Some(std::time::Instant::now() + retry_in)
                     });
                 })
-                .await
-                .context("this shouldn't fail")?;
+                ;
+            let interval = tokio::select! {
+                r = request => r.context("this shouldn't fail")?,
+                // qbt-rs: forced reannounce while backing off after errors: try again now.
+                _ = reannounce.changed() => continue,
+            };
 
             event = None;
             let interval = self.force_tracker_interval.unwrap_or(interval);
@@ -314,7 +321,10 @@ impl TrackerComms {
             });
             self.maybe_scrape_http(&tracker_url).await;
             debug!("sleeping for {:?} after calling tracker", interval);
-            tokio::time::sleep(interval).await;
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {}
+                _ = reannounce.changed() => debug!("forced reannounce"),
+            }
         }
     }
 
@@ -458,11 +468,16 @@ impl TrackerComms {
 
         let mut sleep_interval: Option<Duration> = None;
         let mut prev_addrs: Option<UdpTrackerResolveResult> = None;
+        let mut reannounce = self.statuses.reannounce_signal();
         loop {
             if let Some(i) = sleep_interval {
                 trace!(interval=?sleep_interval, "sleeping");
-                tokio::time::sleep(i).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(i) => {}
+                    _ = reannounce.changed() => debug!("forced reannounce"),
+                }
             }
+            reannounce.mark_unchanged();
 
             // This should retry forever until the addrs are resolved.
             let addrs = (async || {

@@ -1,3 +1,7 @@
+// Modified by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-22: "ws" (BEP 19 web seed)
+// parameters are kept in Magnet::web_seeds and written back by Display.
+// Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
+
 use std::str::FromStr;
 
 use anyhow::Context;
@@ -11,6 +15,8 @@ pub struct Magnet {
     pub trackers: Vec<String>,
     pub name: Option<String>,
     select_only: Option<Vec<usize>>,
+    /// qbt-rs: "ws" parameters (BEP 19 web seeds).
+    pub web_seeds: Vec<String>,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -38,6 +44,7 @@ impl Magnet {
             trackers,
             name: None,
             select_only,
+            web_seeds: Vec::new(),
         }
     }
 
@@ -56,6 +63,7 @@ impl Magnet {
             trackers,
             name: None,
             select_only,
+            web_seeds: Vec::new(),
         })
     }
 
@@ -70,6 +78,7 @@ impl Magnet {
                 name: None,
                 trackers: vec![],
                 select_only: None,
+                web_seeds: Vec::new(),
             });
         }
         let url = url::Url::parse(url).context("magnet link must be a valid URL")?;
@@ -82,6 +91,7 @@ impl Magnet {
         let mut name: Option<String> = None;
         let mut trackers = Vec::<String>::new();
         let mut files = Vec::<usize>::new();
+        let mut web_seeds = Vec::<String>::new();
         for (key, value) in url.query_pairs() {
             match key.as_ref() {
                 "xt" => {
@@ -98,6 +108,7 @@ impl Magnet {
                     }
                 }
                 "tr" => trackers.push(value.into()),
+                "ws" => web_seeds.push(value.into()),
                 "dn" if !value.is_empty() => name = Some(value.into_owned()),
                 "dn" => {}
                 "so" => {
@@ -132,6 +143,7 @@ impl Magnet {
                 trackers,
                 name,
                 select_only: if files.is_empty() { None } else { Some(files) },
+                web_seeds,
             }),
             false => {
                 anyhow::bail!("did not find infohash")
@@ -167,6 +179,10 @@ impl std::fmt::Display for Magnet {
             write_ampersand(f)?;
             write!(f, "tr={tracker}")?;
         }
+        for seed in self.web_seeds.iter() {
+            write_ampersand(f)?;
+            write!(f, "ws={}", url::form_urlencoded::byte_serialize(seed.as_bytes()).collect::<String>())?;
+        }
         if let Some(select_only) = &self.select_only
             && !select_only.is_empty()
         {
@@ -190,6 +206,14 @@ mod tests {
     use crate::Id20;
 
     use super::Magnet;
+
+    #[test]
+    fn web_seeds_from_ws() {
+        let m = Magnet::parse("magnet:?xt=urn:btih:a621779b5e3d486e127c3efbca9b6f8d135f52e5&ws=http%3A%2F%2Fexample.com%2Fa%20b%2F&ws=https://m.example/x").unwrap();
+        assert_eq!(m.web_seeds, vec!["http://example.com/a b/".to_string(), "https://m.example/x".to_string()]);
+        let again = Magnet::parse(&m.to_string()).unwrap();
+        assert_eq!(again.web_seeds, m.web_seeds);
+    }
 
     #[test]
     fn test_parse_magnet_as_url() {

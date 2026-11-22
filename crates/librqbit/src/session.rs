@@ -7,6 +7,15 @@
 //   - per-torrent tracker statuses passed to TrackerComms (ManagedTorrent::tracker_statuses()).
 //   - move_storage() and AddTorrentOptions::save_path; default_subfolder_for_torrent() moved to
 //     a free function so torrents can compute their save path.
+//   - 2026-11-22: torrents get their own runtime-adjustable rate limiter (ManagedTorrentShared).
+//   - 2026-11-22: reannounce(): force every tracker of a torrent to announce now.
+//   - 2026-11-22: peer streams record where each address came from (ManagedTorrentShared::
+//     peer_sources); incoming connections remember whether they were encrypted.
+//   - 2026-11-22: Session::external_ip (our address as peers report it).
+//   - 2026-11-22: magnet links' "ws" parameters become web seeds.
+//   - 2026-11-22: incoming peers may use a hybrid torrent's truncated v2 info hash.
+//   - 2026-11-22: v2-only magnet links ("btmh" only): found under the truncated v2 hash, the
+//     metadata is checked with SHA-256 and the piece layers come from the same peer.
 // Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
 
 use std::{
@@ -128,6 +137,8 @@ pub struct Session {
     announce_port: Option<u16>,
     listen_addr: Option<SocketAddr>,
     dht: Option<Dht>,
+    /// qbt-rs: our external address as peers see it (see external_ip.rs).
+    pub external_ip: crate::external_ip::ExternalIpVoter,
     pub(crate) connector: Arc<StreamConnector>,
     pub(crate) reqwest_client: reqwest::Client,
     udp_tracker_client: UdpTrackerClient,
@@ -536,20 +547,42 @@ impl Default for SessionOptions {
     }
 }
 
-fn torrent_file_from_info_bytes(info_bytes: &[u8], trackers: &[url::Url]) -> anyhow::Result<Bytes> {
+fn torrent_file_from_info_bytes(
+    info_bytes: &[u8],
+    trackers: &[url::Url],
+    piece_layers: &crate::peer_info_reader::PieceLayers,
+) -> anyhow::Result<Bytes> {
     #[derive(Serialize)]
     struct Tmp<'a> {
         announce: &'a str,
         #[serde(rename = "announce-list")]
         announce_list: &'a [&'a [url::Url]],
         info: bencode::raw_value::RawValue<&'a [u8]>,
+        // qbt-rs: v2-only torrents need their piece layers (BEP 52).
+        #[serde(rename = "piece layers", skip_serializing_if = "Option::is_none")]
+        piece_layers: Option<bencode::raw_value::RawValue<&'a [u8]>>,
     }
 
+    // A dict keyed by raw 32-byte roots (sorted, as bencode requires).
+    let layers_raw = (!piece_layers.is_empty()).then(|| {
+        let mut sorted: Vec<_> = piece_layers.iter().collect();
+        sorted.sort_by_key(|(root, _)| *root);
+        let mut out = b"d".to_vec();
+        for (root, layer) in sorted {
+            out.extend_from_slice(b"32:");
+            out.extend_from_slice(root);
+            out.extend_from_slice(format!("{}:", layer.len()).as_bytes());
+            out.extend_from_slice(layer);
+        }
+        out.push(b'e');
+        out
+    });
     let mut w = Vec::new();
     let v = Tmp {
         info: bencode::raw_value::RawValue(info_bytes),
         announce: trackers.first().map(|s| s.as_str()).unwrap_or(""),
         announce_list: &[trackers],
+        piece_layers: layers_raw.as_deref().map(bencode::raw_value::RawValue),
     };
     bencode_serialize_to_writer(&v, &mut w)?;
     Ok(w.into())
@@ -562,10 +595,14 @@ pub(crate) struct CheckedIncomingConnection {
     pub writer: BoxAsyncWrite,
     pub read_buf: ReadBuf,
     pub handshake: Handshake,
+    /// qbt-rs: None = plaintext; Some(true) = RC4 stream; Some(false) = only the handshake.
+    pub encrypted: Option<bool>,
 }
 
 struct InternalAddResult {
     info_hash: Id20,
+    /// qbt-rs: the SHA-256 info hash of a v2-only magnet link (to check its metadata).
+    info_hash_v2: Option<librqbit_core::Id32>,
     metadata: Option<TorrentMetadata>,
     trackers: Vec<url::Url>,
     /// qbt-rs: BEP 19 web seeds from the .torrent's "url-list".
@@ -810,6 +847,7 @@ impl Session {
                 bitv_factory,
                 peer_id,
                 dht,
+                external_ip: Default::default(),
                 peer_opts,
                 spawner: spawner.clone(),
                 output_folder: default_output_folder,
@@ -965,6 +1003,7 @@ impl Session {
             .await
             .context("timeout reading handshake")?
             .context("error reading handshake")?;
+        let mut encrypted = None;
         let (mut reader, writer): (BoxAsyncReadVectored, BoxAsyncWrite) =
             if &first == crate::mse::BT_HANDSHAKE_PREFIX {
                 if policy == crate::mse::EncryptionPolicy::Required {
@@ -981,7 +1020,8 @@ impl Session {
                     .read()
                     .torrents
                     .values()
-                    .map(|t| (crate::mse::req2_hash(&t.info_hash()), t.info_hash()))
+                    .flat_map(|t| t.handshake_info_hashes())
+                    .map(|ih| (crate::mse::req2_hash(&ih), ih))
                     .collect();
                 let mut writer = writer;
                 let established = tokio::time::timeout(
@@ -993,6 +1033,7 @@ impl Session {
                 .await
                 .context("timeout during encrypted handshake")??;
                 trace!(?addr, selected = established.selected, "encrypted handshake done");
+                encrypted = Some(established.selected == crate::mse::CRYPTO_RC4);
                 let reader =
                     crate::mse::MseReader::new(reader, established.prefix, established.read_cipher);
                 let writer = crate::mse::MseWriter::new(writer, established.write_cipher);
@@ -1015,7 +1056,8 @@ impl Session {
             .read()
             .torrents
             .iter()
-            .find(|(_, t)| t.info_hash() == h.info_hash)
+            // qbt-rs: hybrid torrents also accept the truncated v2 info hash (BEP 52).
+            .find(|(_, t)| t.handshake_info_hashes().contains(&h.info_hash))
             .map(|(id, t)| (*id, t.clone()))
             .with_context(|| format!("didn't find a matching torrent {:?}", h.info_hash))?;
 
@@ -1033,6 +1075,7 @@ impl Session {
                 kind,
                 handshake: h,
                 read_buf,
+                encrypted,
             },
         ))
     }
@@ -1171,9 +1214,13 @@ impl Session {
                 {
                     let magnet = Magnet::parse(&magnet)
                         .context("provided path is not a valid magnet URL")?;
+                    // qbt-rs: a v2-only magnet ("btmh" only) is found under the truncated v2
+                    // hash (BEP 52); hybrid magnets use the v1 hash.
                     let info_hash = magnet
                         .as_id20()
-                        .context("magnet link didn't contain a BTv1 infohash")?;
+                        .or_else(|| magnet.as_id32().map(|v2| v2.truncate_for_dht()))
+                        .context("magnet link has no info hash")?;
+                    let magnet_v2 = magnet.as_id20().is_none().then(|| magnet.as_id32()).flatten();
                     if let Some(so) = magnet.get_select_only() {
                         // Only overwrite opts.only_files if user didn't specify
                         if opts.only_files.is_none() {
@@ -1183,12 +1230,19 @@ impl Session {
 
                     InternalAddResult {
                         info_hash,
+                        info_hash_v2: magnet_v2,
                         trackers: magnet
                             .trackers
                             .into_iter()
                             .filter_map(|t| url::Url::parse(&t).ok())
                             .collect(),
-                        web_seeds: Vec::new(),
+                        // qbt-rs: "ws" parameters (BEP 19) of the magnet link.
+                        web_seeds: magnet
+                            .web_seeds
+                            .iter()
+                            .filter_map(|w| url::Url::parse(w).ok())
+                            .filter(|u| matches!(u.scheme(), "http" | "https"))
+                            .collect(),
                         metadata: None,
                         name: magnet.name,
                     }
@@ -1231,6 +1285,7 @@ impl Session {
                         crate::web_seed::url_list_from_torrent_bytes(&torrent.torrent_bytes);
                     InternalAddResult {
                         info_hash: torrent.meta.info_hash,
+                        info_hash_v2: None,
                         web_seeds,
                         metadata: Some(TorrentMetadata::new(
                             torrent.meta.info.data.validate()?,
@@ -1267,6 +1322,7 @@ impl Session {
     ) -> anyhow::Result<AddTorrentResponse> {
         let InternalAddResult {
             info_hash,
+            info_hash_v2: magnet_v2,
             metadata,
             trackers,
             web_seeds,
@@ -1276,6 +1332,7 @@ impl Session {
         let private = metadata.as_ref().is_some_and(|m| m.info.info().private);
         // qbt-rs: created before the torrent so the first announces are recorded too.
         let tracker_statuses = TrackerStatuses::default();
+        let peer_sources = crate::peer_source::PeerSources::default();
 
         let make_peer_rx = || {
             self.make_peer_rx(
@@ -1286,6 +1343,7 @@ impl Session {
                 opts.initial_peers.clone().unwrap_or_default(),
                 private,
                 tracker_statuses.clone(),
+                peer_sources.clone(),
             )
         };
 
@@ -1305,7 +1363,7 @@ impl Session {
                         "no known way to resolve peers (no DHT, no trackers, no initial_peers)",
                     )?;
                     let resolved_magnet = self
-                        .resolve_magnet(info_hash, peer_rx, &trackers, opts.peer_opts)
+                        .resolve_magnet(info_hash, magnet_v2, peer_rx, &trackers, opts.peer_opts)
                         .await?;
 
                     // Add back seen_peers into the peer stream, as we consumed some peers
@@ -1418,12 +1476,13 @@ impl Session {
                     peer_max_request_window: peer_opts.max_request_window,
                     allow_overwrite: opts.overwrite,
                     output_folder: RwLock::new(output_folder),
-                    ratelimits: opts.ratelimits,
                     initial_peers: opts.initial_peers.clone().unwrap_or_default(),
                     peer_limit: opts.peer_limit.or(self.peer_limit),
                     #[cfg(feature = "disable-upload")]
                     _disable_upload: self._disable_upload,
                 },
+                ratelimits: Arc::new(Limits::new(opts.ratelimits)),
+                peer_sources,
                 connector: self.connector.clone(),
                 session: Arc::downgrade(self),
                 magnet_name: name,
@@ -1590,6 +1649,7 @@ impl Session {
             t.shared().options.initial_peers.clone(),
             is_private,
             t.shared().tracker_statuses.clone(),
+            t.shared().peer_sources.clone(),
         )
     }
 
@@ -1605,12 +1665,19 @@ impl Session {
         initial_peers: Vec<SocketAddr>,
         is_private: bool,
         tracker_statuses: TrackerStatuses,
+        sources: crate::peer_source::PeerSources,
     ) -> Option<PeerStream> {
+        use crate::peer_source::{FROM_DHT, FROM_LSD, FROM_TRACKER};
+        let tag = |source: u8| {
+            let sources = sources.clone();
+            move |addr: &SocketAddr| sources.mark(*addr, source)
+        };
         let dht_rx = if is_private {
             None
         } else {
             self.dht.as_ref().map(|dht| {
                 dht.get_peers(info_hash, if announce { self.announce_port } else { None })
+                    .inspect(tag(FROM_DHT))
             })
         };
 
@@ -1619,6 +1686,7 @@ impl Session {
         } else {
             self.lsd.as_ref().map(|lsd| {
                 lsd.announce(info_hash, if announce { self.announce_port } else { None })
+                    .inspect(tag(FROM_LSD))
             })
         };
 
@@ -1650,7 +1718,8 @@ impl Session {
             self.reqwest_client.clone(),
             self.udp_tracker_client.clone(),
             tracker_statuses,
-        );
+        )
+        .map(|rx| rx.inspect(tag(FROM_TRACKER)));
 
         let initial_peers_rx = if initial_peers.is_empty() {
             None
@@ -1701,6 +1770,37 @@ impl Session {
         handle.start(peer_rx, paused)?;
         self.try_update_persistence_metadata(handle).await;
         Ok(())
+    }
+
+    /// qbt-rs: qBittorrent's "Force reannounce": every tracker announces now, ignoring its
+    /// (min) interval (libtorrent `force_reannounce(0, -1, ignore_min_interval)`), and, for
+    /// public torrents, one more DHT lookup (`force_dht_announce`) whose peers are added for a
+    /// minute. Only does anything while the torrent is running.
+    pub fn reannounce(self: &Arc<Self>, handle: &ManagedTorrentHandle) {
+        let Some(live) = handle.live() else {
+            return;
+        };
+        handle.shared().tracker_statuses.reannounce();
+        let is_private = handle.with_metadata(|m| m.info.info().private).unwrap_or(false);
+        let Some(dht) = self.dht.clone().filter(|_| !is_private) else {
+            return;
+        };
+        let mut peers = dht.get_peers(handle.info_hash(), self.announce_port);
+        self.spawn(
+            debug_span!(parent: handle.shared().span.clone(), "forced_dht_announce"),
+            "forced_dht_announce",
+            async move {
+                let _ = tokio::time::timeout(Duration::from_secs(60), async {
+                    while let Some(addr) = peers.next().await {
+                        if live.add_peer_if_not_seen(addr).is_err() {
+                            break;
+                        }
+                    }
+                })
+                .await;
+                Ok(())
+            },
+        );
     }
 
     /// qbt-rs: move a torrent's files to a new save path (qBittorrent's "Set location").
@@ -1799,6 +1899,7 @@ impl Session {
     async fn resolve_magnet(
         self: &Arc<Self>,
         info_hash: Id20,
+        info_hash_v2: Option<librqbit_core::Id32>,
         peer_rx: PeerStream,
         trackers: &[url::Url],
         peer_opts: Option<PeerConnectionOptions>,
@@ -1806,6 +1907,7 @@ impl Session {
         match read_metainfo_from_peer_receiver(
             self.peer_id,
             info_hash,
+            info_hash_v2,
             Default::default(),
             peer_rx,
             Some(self.merge_peer_opts(peer_opts)),
@@ -1817,6 +1919,7 @@ impl Session {
             ReadMetainfoResult::Found {
                 info,
                 info_bytes,
+                piece_layers,
                 rx,
                 seen,
             } => {
@@ -1825,7 +1928,7 @@ impl Session {
                 Ok(ResolveMagnetResult {
                     metadata: TorrentMetadata::new(
                         info,
-                        torrent_file_from_info_bytes(info_bytes.as_ref(), trackers)?,
+                        torrent_file_from_info_bytes(info_bytes.as_ref(), trackers, &piece_layers)?,
                         info_bytes.0,
                     )?,
                     peer_rx: rx,
@@ -2117,7 +2220,7 @@ mod tests {
         let parsed_trackers = get_trackers(&parsed);
 
         let generated_torrent =
-            torrent_file_from_info_bytes(parsed.info.raw_bytes.as_ref(), &parsed_trackers).unwrap();
+            torrent_file_from_info_bytes(parsed.info.raw_bytes.as_ref(), &parsed_trackers, &Vec::new()).unwrap();
         let generated_parsed = torrent_from_bytes(generated_torrent.as_ref()).unwrap();
         assert_eq!(parsed.info_hash, generated_parsed.info_hash);
         assert_eq!(parsed.info, generated_parsed.info);

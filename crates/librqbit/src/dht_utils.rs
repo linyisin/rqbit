@@ -1,3 +1,7 @@
+// Modified by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-22: v2-only magnet links (the
+// SHA-256 info hash is passed on; the result has the piece layers).
+// Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
+
 use std::{collections::HashSet, net::SocketAddr, sync::Arc};
 
 use anyhow::Context;
@@ -18,6 +22,8 @@ pub enum ReadMetainfoResult<Rx> {
     Found {
         info: TorrentMetaV1Info<ByteBufOwned>,
         info_bytes: ByteBufOwned,
+        /// qbt-rs: piece layers of a v2-only torrent (empty otherwise).
+        piece_layers: peer_info_reader::PieceLayers,
         rx: Rx,
         seen: HashSet<SocketAddr>,
     },
@@ -27,9 +33,12 @@ pub enum ReadMetainfoResult<Rx> {
     },
 }
 
+// qbt-rs: one more argument (the v2 info hash of v2-only magnet links).
+#[allow(clippy::too_many_arguments)]
 pub async fn read_metainfo_from_peer_receiver<A: Stream<Item = SocketAddr> + Unpin>(
     peer_id: Id20,
     info_hash: Id20,
+    info_hash_v2: Option<librqbit_core::hash_id::Id32>,
     initial_addrs: Vec<SocketAddr>,
     addrs_stream: A,
     peer_connection_options: Option<PeerConnectionOptions>,
@@ -51,6 +60,7 @@ pub async fn read_metainfo_from_peer_receiver<A: Stream<Item = SocketAddr> + Unp
                 addr,
                 peer_id,
                 info_hash,
+                info_hash_v2,
                 peer_connection_options,
                 // This shouldn't be called anyway as we aren't reading/writing to disk, so it's
                 // ok not to use a shared one.
@@ -83,7 +93,7 @@ pub async fn read_metainfo_from_peer_receiver<A: Stream<Item = SocketAddr> + Unp
         tokio::select! {
             done = unordered.next(), if !unordered.is_empty() => {
                 match done {
-                    Some(Ok((info, info_bytes))) => return ReadMetainfoResult::Found { info, info_bytes, seen, rx: addrs },
+                    Some(Ok((info, info_bytes, piece_layers))) => return ReadMetainfoResult::Found { info, info_bytes, piece_layers, seen, rx: addrs },
                     Some(Err(e)) => {
                         debug!("{:#}", e);
                     },
@@ -141,6 +151,7 @@ mod tests {
         match read_metainfo_from_peer_receiver(
             peer_id,
             info_hash,
+            None,
             Vec::new(),
             peer_rx,
             None,

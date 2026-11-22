@@ -1,9 +1,11 @@
+// Modified by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-22: mark_chunk_downloaded() takes
+// the chunk the caller already validated (BitTorrent v2 blocks at the end of a file are shorter).
+// Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
+
 use std::collections::HashSet;
 
 use anyhow::Context;
-use buffers::ByteBuf;
 use librqbit_core::lengths::{ChunkInfo, Lengths, ValidPieceIndex};
-use peer_binary_protocol::Piece;
 use tracing::{debug, trace};
 
 use crate::{
@@ -299,24 +301,19 @@ impl ChunkTracker {
     }
 
     // return true if the whole piece is marked downloaded
-    pub fn mark_chunk_downloaded(
-        &mut self,
-        piece: &Piece<ByteBuf<'_>>,
-    ) -> Option<ChunkMarkingResult> {
-        let chunk_info = self.lengths.chunk_info_from_received_data(
-            self.lengths.validate_piece_index(piece.index)?,
-            piece.begin,
-            piece.len().try_into().unwrap(),
-        )?;
+    pub fn mark_chunk_downloaded(&mut self, chunk_info: &ChunkInfo) -> Option<ChunkMarkingResult> {
         let chunk_range = self.lengths.chunk_range(chunk_info.piece_index);
-        let chunk_range = self.chunk_status.get_mut(chunk_range).unwrap();
+        let chunk_range = self.chunk_status.get_mut(chunk_range)?;
+        if chunk_info.chunk_index as usize >= chunk_range.len() {
+            return None;
+        }
         if chunk_range.all() {
             return Some(ChunkMarkingResult::PreviouslyCompleted);
         }
         chunk_range.set(chunk_info.chunk_index as usize, true);
         trace!(
             "piece={}, chunk_info={:?}, bits={:?}",
-            piece.index, chunk_info, chunk_range,
+            chunk_info.piece_index, chunk_info, chunk_range,
         );
 
         if chunk_range.all() {

@@ -1,5 +1,6 @@
 // Modified by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-18:
 //   - outgoing connections: encrypted (MSE/PE) handshake per ConnectionOptions::encryption.
+//   - 2026-11-22: PeerConnectionHandler::on_encrypted() reports the MSE/PE result.
 //   - 2026-11-21: WriterRequest::Hashes, the answer to a BitTorrent v2 hash request (BEP 52).
 // Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
 
@@ -40,6 +41,8 @@ use crate::{
 
 pub trait PeerConnectionHandler {
     fn on_connected(&self, _connection_time: Duration) {}
+    /// qbt-rs: the encrypted (MSE/PE) handshake succeeded; `rc4` = the whole stream is encrypted.
+    fn on_encrypted(&self, _rc4: bool) {}
     fn should_send_bitfield(&self) -> bool;
     fn serialize_bitfield_message_to_buf(&self, buf: &mut [u8]) -> anyhow::Result<usize>;
     fn on_handshake(&self, handshake: Handshake, ckind: ConnectionKind) -> anyhow::Result<()>;
@@ -312,6 +315,8 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         match result {
             Ok(established) => {
                 trace!(selected = established.selected, "encrypted handshake done");
+                self.handler
+                    .on_encrypted(established.selected == crate::mse::CRYPTO_RC4);
                 let read: BoxAsyncReadVectored = Box::new(
                     MseReader::new(read, established.prefix, established.read_cipher)
                         .into_vectored_compat(),

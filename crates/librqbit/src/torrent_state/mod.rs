@@ -7,6 +7,11 @@
 //     stop_for_move(), restore_after_move().
 //   - 2026-11-21: TorrentMetadata loads and checks the piece layers of BitTorrent v2-only
 //     torrents (BEP 52) and keeps the v2 info hash.
+//   - 2026-11-22: per-torrent rate limits can change at any time (ratelimits() /
+//     set_ratelimits(); the limiter lives in ManagedTorrentShared and survives pause/resume).
+//   - 2026-11-22: ManagedTorrentShared::peer_sources (for qBittorrent's peer flags).
+//   - 2026-11-22: add_web_seed() / remove_web_seed().
+//   - 2026-11-22: handshake_info_hashes() (hybrid torrents also answer to the v2 hash).
 // Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
 
 pub mod initializing;
@@ -130,7 +135,6 @@ pub(crate) struct ManagedTorrentOptions {
     pub allow_overwrite: bool,
     /// qbt-rs: behind a lock so that Session::move_storage() can change it.
     pub output_folder: RwLock<PathBuf>,
-    pub ratelimits: LimitsConfig,
     pub initial_peers: Vec<SocketAddr>,
     pub peer_limit: Option<usize>,
     #[cfg(feature = "disable-upload")]
@@ -225,6 +229,10 @@ pub struct ManagedTorrentShared {
     pub peer_id: Id20,
     pub span: tracing::Span,
     pub(crate) options: ManagedTorrentOptions,
+    /// qbt-rs: per-torrent rate limiter, shared with the live state so changes apply at once.
+    pub(crate) ratelimits: Arc<crate::limits::Limits>,
+    /// qbt-rs: where each peer address came from (tracker, DHT, PEX, LSD).
+    pub(crate) peer_sources: crate::peer_source::PeerSources,
     pub(crate) connector: Arc<StreamConnector>,
     pub(crate) storage_factory: BoxStorageFactory,
     pub(crate) session: Weak<Session>,
@@ -272,6 +280,17 @@ impl ManagedTorrent {
         &self.shared
     }
 
+    /// qbt-rs: this torrent's own rate limits (on top of the session-wide ones).
+    pub fn ratelimits(&self) -> LimitsConfig {
+        self.shared.ratelimits.get_config()
+    }
+
+    /// qbt-rs: change this torrent's own rate limits; applies immediately, also while live.
+    pub fn set_ratelimits(&self, limits: LimitsConfig) {
+        self.shared.ratelimits.set_download_bps(limits.download_bps);
+        self.shared.ratelimits.set_upload_bps(limits.upload_bps);
+    }
+
     /// The resolved on-disk folder this torrent's files are written under.
     ///
     /// qbt-rs: returns an owned path because Session::move_storage() can change it.
@@ -306,6 +325,23 @@ impl ManagedTorrent {
     /// qbt-rs: the torrent's HTTP web seeds (BEP 19) and what they are doing.
     pub fn web_seeds(&self) -> Vec<crate::web_seed::WebSeedStatus> {
         self.shared.web_seeds.statuses()
+    }
+
+    /// qbt-rs: add a web seed (qBittorrent's "Add web seed"); starts downloading from it at
+    /// once if the torrent is running. False if it was already there.
+    pub fn add_web_seed(&self, url: url::Url) -> bool {
+        let Some(seed) = self.shared.web_seeds.add(url) else {
+            return false;
+        };
+        if let Some(live) = self.live() {
+            live.spawn_web_seed(seed);
+        }
+        true
+    }
+
+    /// qbt-rs: remove a web seed (qBittorrent's "Remove web seed"). False if there was none.
+    pub fn remove_web_seed(&self, url: &url::Url) -> bool {
+        self.shared.web_seeds.remove(url)
     }
 
     /// qbt-rs: whether Session::move_storage() is currently moving this torrent's files.
@@ -357,6 +393,19 @@ impl ManagedTorrent {
 
     pub fn info_hash(&self) -> Id20 {
         self.shared.info_hash
+    }
+
+    /// qbt-rs: every info hash peers may use for this torrent in the handshake: the v1 hash
+    /// and, for hybrid torrents, the v2 hash truncated to 20 bytes (BEP 52).
+    pub fn handshake_info_hashes(&self) -> Vec<Id20> {
+        let mut hashes = vec![self.shared.info_hash];
+        if let Some(v2) = self.metadata.load().as_ref().and_then(|m| m.info_hash_v2) {
+            let truncated = v2.truncate_for_dht();
+            if truncated != self.shared.info_hash {
+                hashes.push(truncated);
+            }
+        }
+        hashes
     }
 
     pub fn only_files(&self) -> Option<Vec<usize>> {

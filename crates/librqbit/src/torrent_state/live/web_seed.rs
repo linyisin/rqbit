@@ -13,6 +13,8 @@
 //   libtorrent's `retry_web_seed`.
 // Web seeds never steal pieces from peers; peers may steal from a slow web seed (the write path
 // then drops the web seed's data, as it does for a peer).
+// 2026-11-22: web seeds added while the torrent runs get their own task (spawn_web_seed); a
+// removed web seed's task stops and gives its reserved pieces back.
 
 use std::{
     num::NonZeroU32,
@@ -38,7 +40,6 @@ use crate::{
 const PIPELINE: usize = 5;
 const TIMEOUT: Duration = Duration::from_secs(20);
 const RETRY: Duration = Duration::from_secs(30);
-const MAX_CONNECTIONS: usize = 3;
 
 /// The files of the torrent as seen from one web seed.
 struct SeedFiles {
@@ -68,21 +69,24 @@ impl From<Error> for SeedError {
 impl TorrentStateLive {
     /// Starts one task per web seed. At most `MAX_CONNECTIONS` of them download at a time.
     pub(super) fn start_web_seeds(self: &Arc<Self>) {
-        if self.shared.web_seeds.is_empty() {
-            return;
+        for seed in self.shared.web_seeds.list() {
+            self.spawn_web_seed(seed);
         }
+    }
+
+    /// qbt-rs: starts the task of one web seed (also used for web seeds added while live).
+    pub(crate) fn spawn_web_seed(self: &Arc<Self>, seed: Arc<WebSeed>) {
         let Some(session) = self.shared.session.upgrade() else {
             return;
         };
         let client = session.reqwest_client.clone();
-        let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
-        for index in 0..self.shared.web_seeds.seeds.len() {
-            self.spawn(
-                debug_span!(parent: self.shared.span.clone(), "web_seed", index),
-                format!("[{}]web_seed[{index}]", self.shared.id),
-                self.clone().task_web_seed(index, client.clone(), slots.clone()),
-            );
-        }
+        let slots = self.shared.web_seeds.slots.clone();
+        let index = seed.id;
+        self.spawn(
+            debug_span!(parent: self.shared.span.clone(), "web_seed", index),
+            format!("[{}]web_seed[{index}]", self.shared.id),
+            self.clone().task_web_seed(seed, client, slots),
+        );
     }
 
     fn web_seed_files(&self, base: &url::Url) -> SeedFiles {
@@ -111,13 +115,34 @@ impl TorrentStateLive {
 
     async fn task_web_seed(
         self: Arc<Self>,
-        index: usize,
+        seed: Arc<WebSeed>,
         client: reqwest::Client,
         slots: Arc<Semaphore>,
     ) -> crate::Result<()> {
-        let seed = &self.shared.web_seeds.seeds[index];
+        let addr = pseudo_addr(seed.id);
+        let removed = seed.removed.clone();
+        let result = tokio::select! {
+            r = self.web_seed_loop(&seed, addr, client, slots) => r,
+            _ = removed.cancelled() => Ok(()),
+        };
+        if removed.is_cancelled() {
+            debug!(url = %seed.url, "web seed removed");
+            if let Ok(pieces) = self.lock_write("web_seed_removed").get_pieces_mut() {
+                pieces.release_pieces_owned_by(addr);
+            }
+            self.new_pieces_notify.notify_waiters();
+        }
+        result
+    }
+
+    async fn web_seed_loop(
+        &self,
+        seed: &WebSeed,
+        addr: PeerHandle,
+        client: reqwest::Client,
+        slots: Arc<Semaphore>,
+    ) -> crate::Result<()> {
         let files = self.web_seed_files(&seed.url);
-        let addr = pseudo_addr(index);
         let counters = AtomicPeerCounters::default();
         loop {
             if self.is_finished() {

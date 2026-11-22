@@ -1,5 +1,7 @@
 // Added by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-21: end-to-end tests for
 // BitTorrent v2-only torrents (BEP 52). Licensed under Apache-2.0 like the rest of rqbit.
+// 2026-11-22: test_e2e_created_v2_and_hybrid_torrents (torrent_creator, hybrid v2 handshakes);
+// the v2-only test also downloads from a "btmh" magnet link.
 //
 // The torrent is built here from the spec: each file's merkle root is computed the plain way
 // (the whole tree, zero-padded leaves), the piece layers piece by piece. A seeder checks the files
@@ -281,6 +283,48 @@ async fn e2e_v2_only_torrent() -> anyhow::Result<()> {
     }
     assert!(!dl_dir.join(".pad").exists(), "padding is never written");
 
+    // 3b. qbt-rs: the same torrent from a v2-only magnet link ("btmh" only): the metadata comes
+    // over ut_metadata (checked with SHA-256), the piece layers with hash requests.
+    let magnet_root = tempfile::TempDir::with_prefix("rqbit_e2e_v2_magnet").unwrap();
+    let magnet_dir = magnet_root.path().join("out");
+    let magnet_client = Session::new_with_opts(
+        magnet_dir.clone(),
+        SessionOptions {
+            dht: None,
+            persistence: None,
+            listen: None,
+            disable_local_service_discovery: true,
+            root_span: Some(error_span!(parent: None, "magnet")),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let magnet = format!("magnet:?xt=urn:btmh:1220{}&dn=v2", hex::encode(torrent.info_hash_v2));
+    let magnet_handle = timeout(
+        Duration::from_secs(30),
+        magnet_client.add_torrent(
+            AddTorrent::from_url(&magnet),
+            Some(AddTorrentOptions {
+                initial_peers: Some(vec![seeder_addr]),
+                output_folder: Some(magnet_dir.to_str().unwrap().to_owned()),
+                ..Default::default()
+            }),
+        ),
+    )
+    .await
+    .context("timeout resolving the v2 magnet")??
+    .into_handle()
+    .context("into_handle()")?;
+    timeout(Duration::from_secs(45), magnet_handle.wait_until_completed())
+        .await
+        .context("timeout waiting for the magnet download")?
+        .context("magnet download error")?;
+    for (name, data) in &torrent.files {
+        if !data.is_empty() {
+            assert_eq!(&std::fs::read(magnet_dir.join(name))?, data, "magnet: {name}");
+        }
+    }
+
     // 4. A corrupted copy is detected by the v2 check.
     let bad_dir = tempfile::TempDir::with_prefix("rqbit_e2e_v2_bad").unwrap();
     let mut files = torrent.files.clone();
@@ -396,5 +440,76 @@ async fn check_hash_requests(seeder: SocketAddr, torrent: &V2Torrent) -> anyhow:
     let (ok, echoed, _) = hash_answer(&mut stream).await?;
     assert!(!ok);
     assert_eq!(echoed, request);
+    Ok(())
+}
+
+/// qbt-rs: torrents made by `torrent_creator` (v2-only and hybrid) pass rqbit's own check of the
+/// files they were made from; a hybrid seeder also answers a peer that uses the truncated v2
+/// info hash (BEP 52), with that same hash.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_e2e_created_v2_and_hybrid_torrents() -> anyhow::Result<()> {
+    use crate::torrent_creator::{TorrentCreatorOptions, TorrentFormat, create_torrent_file};
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    setup_test_logging();
+    let dir = tempfile::TempDir::with_prefix("rqbit_e2e_created").unwrap();
+    let root = dir.path().join("content");
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    let data = |n: usize, seed: u32| -> Vec<u8> {
+        (0..u32::try_from(n).unwrap()).map(|i| i.wrapping_mul(2_246_822_519).wrapping_add(seed).to_le_bytes()[1]).collect()
+    };
+    std::fs::write(root.join("a.bin"), data(5 * BLOCK_SIZE as usize + 123, 1)).unwrap();
+    std::fs::write(root.join("sub/b.bin"), data(1000, 2)).unwrap();
+    std::fs::write(root.join("z.bin"), data(3 * BLOCK_SIZE as usize, 3)).unwrap();
+
+    for format in [TorrentFormat::V2, TorrentFormat::Hybrid] {
+        let created = create_torrent_file(
+            &root,
+            &TorrentCreatorOptions { format, piece_length: Some(PIECE_LENGTH), ..Default::default() },
+            &AtomicU64::new(0),
+            &AtomicBool::new(false),
+        )?;
+        let session = Session::new_with_opts(
+            dir.path().join(format!("{format:?}")),
+            SessionOptions {
+                dht: None,
+                persistence: None,
+                listen: Some(ListenerOptions {
+                    mode: ListenerMode::TcpOnly,
+                    listen_addr: (Ipv4Addr::LOCALHOST, 0).into(),
+                    ..Default::default()
+                }),
+                disable_local_service_discovery: true,
+                root_span: Some(error_span!(parent: None, "created")),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let handle = session
+            .add_torrent(
+                AddTorrent::TorrentFileBytes(created.bytes.clone()),
+                Some(AddTorrentOptions {
+                    overwrite: true,
+                    output_folder: Some(root.to_str().unwrap().to_owned()),
+                    ..Default::default()
+                }),
+            )
+            .await?
+            .into_handle()
+            .context("into_handle()")?;
+        wait_live_and_finished(&handle).await.with_context(|| format!("{format:?}"))?;
+
+        if format == TorrentFormat::Hybrid {
+            let v2 = Id20::from_bytes(&created.info_hash_v2.unwrap().0[..20])?;
+            assert_ne!(Some(v2), created.info_hash_v1);
+            let mut stream = TcpStream::connect(session.listen_addr().unwrap()).await?;
+            let mut buf = [0u8; 68];
+            let len = Handshake::new(v2, Id20::new([9; 20])).serialize_unchecked_len(&mut buf);
+            stream.write_all(&buf[..len]).await?;
+            timeout(Duration::from_secs(10), stream.read_exact(&mut buf)).await??;
+            let (theirs, _) = Handshake::deserialize(&buf).context("seeder handshake")?;
+            assert_eq!(theirs.info_hash, v2, "a hybrid torrent answers with the hash the peer used");
+        }
+        session.stop().await;
+    }
     Ok(())
 }

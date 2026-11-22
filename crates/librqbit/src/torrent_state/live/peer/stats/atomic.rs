@@ -1,3 +1,7 @@
+// Modified by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-22: PeerCountersAtomic::conn_flags
+// (choke/interest/direction/encryption of the current connection, for qBittorrent's peer flags).
+// Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
+
 use std::{
     sync::{
         Arc,
@@ -23,6 +27,33 @@ pub(crate) struct PeerCountersAtomic {
     pub total_piece_download_ms: AtomicU64,
     pub times_stolen_from_me: AtomicU32,
     pub times_i_stole: AtomicU32,
+    /// qbt-rs: `conn_flags::*` bits of the current connection.
+    pub conn_flags: AtomicU32,
+}
+
+/// qbt-rs: bits of [`PeerCountersAtomic::conn_flags`].
+pub(crate) mod conn_flags {
+    /// We are interested in the peer.
+    pub const INTERESTING: u32 = 1;
+    /// The peer unchoked us.
+    pub const REMOTE_UNCHOKED: u32 = 2;
+    /// The peer connected to us.
+    pub const INCOMING: u32 = 4;
+    /// The whole stream is RC4 encrypted (MSE/PE).
+    pub const RC4: u32 = 8;
+    /// Only the handshake was encrypted (MSE/PE with plaintext selected).
+    pub const PLAINTEXT_ENCRYPTED: u32 = 16;
+}
+
+impl PeerCountersAtomic {
+    /// qbt-rs: set or clear connection flag bits.
+    pub(crate) fn set_conn_flag(&self, bit: u32, on: bool) {
+        if on {
+            self.conn_flags.fetch_or(bit, Ordering::Relaxed);
+        } else {
+            self.conn_flags.fetch_and(!bit, Ordering::Relaxed);
+        }
+    }
 }
 
 impl PeerCountersAtomic {
