@@ -79,7 +79,7 @@ impl TorrentStateLive {
         let Some(session) = self.shared.session.upgrade() else {
             return;
         };
-        let client = session.reqwest_client.clone();
+        let client = session.web_seed_client();
         let slots = self.shared.web_seeds.slots.clone();
         let index = seed.id;
         self.spawn(

@@ -1,5 +1,7 @@
 // Modified by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-18:
 //   - ConnectionOptions::encryption / StreamConnector::encryption() (MSE/PE policy).
+//   - 2026-11-22: HTTP proxies (http://, CONNECT tunnels) besides SOCKS5 for peer connections, and
+//     ConnectionOptions::proxy_trackers_only (qBittorrent's "Use proxy for peer connections" off).
 // Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
@@ -39,7 +41,10 @@ impl std::fmt::Display for ConnectionKind {
 pub struct ConnectionOptions {
     // socks5://[username:password@]host:port
     // If set, all outgoing connections will go through the proxy over TCP.
+    // qbt-rs: http://[username:password@]host:port is accepted too (HTTP CONNECT).
     pub proxy_url: Option<String>,
+    /// qbt-rs: use the proxy for tracker requests only, not for peer connections.
+    pub proxy_trackers_only: bool,
     // TCP outgoing connections are enabled by default
     pub enable_tcp: bool,
     pub peer_opts: Option<PeerConnectionOptions>,
@@ -52,17 +57,73 @@ impl Default for ConnectionOptions {
         Self {
             enable_tcp: true,
             proxy_url: None,
+            proxy_trackers_only: false,
             peer_opts: None,
             encryption: Default::default(),
         }
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProxyKind {
+    Socks5,
+    /// qbt-rs: an HTTP proxy, tunnelling with CONNECT.
+    Http,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct SocksProxyConfig {
+    pub kind: ProxyKind,
     pub host: String,
     pub port: u16,
     pub username_password: Option<(String, String)>,
+}
+
+/// qbt-rs: a proxied stream of either kind.
+trait ProxyStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> ProxyStream for T {}
+
+#[cfg(test)]
+pub(crate) async fn http_connect_for_tests(proxy: &SocksProxyConfig, addr: SocketAddr) -> anyhow::Result<tokio::net::TcpStream> {
+    http_connect(proxy, addr).await
+}
+
+/// qbt-rs: opens a tunnel to `addr` through an HTTP proxy (RFC 9110 CONNECT).
+async fn http_connect(
+    proxy: &SocksProxyConfig,
+    addr: SocketAddr,
+) -> anyhow::Result<tokio::net::TcpStream> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect((proxy.host.as_str(), proxy.port))
+        .await
+        .context("error connecting to the HTTP proxy")?;
+    let mut request = format!("CONNECT {addr} HTTP/1.1\r\nHost: {addr}\r\n");
+    if let Some((user, pass)) = proxy.username_password.as_ref() {
+        use base64::Engine;
+        let token = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
+        request.push_str(&format!("Proxy-Authorization: Basic {token}\r\n"));
+    }
+    request.push_str("\r\n");
+    stream.write_all(request.as_bytes()).await?;
+    // Read the response head byte by byte, so nothing after it (peer data) is consumed.
+    let mut head = Vec::with_capacity(256);
+    while !head.ends_with(b"\r\n\r\n") {
+        if head.len() > 8192 {
+            bail!("the HTTP proxy's response is too long");
+        }
+        let mut byte = [0u8; 1];
+        if stream.read(&mut byte).await? == 0 {
+            bail!("the HTTP proxy closed the connection");
+        }
+        head.push(byte[0]);
+    }
+    let status_line = head.split(|b| *b == b'\n').next().unwrap_or_default();
+    let status = std::str::from_utf8(status_line).unwrap_or_default().trim();
+    let code = status.split_whitespace().nth(1).unwrap_or_default();
+    if code != "200" {
+        bail!("the HTTP proxy refused the tunnel: {status}");
+    }
+    Ok(stream)
 }
 
 #[derive(Default, Debug, Clone)]
@@ -79,16 +140,18 @@ impl SocksProxyConfig {
     /// socks5h:// resolves hostnames via the proxy; socks5:// resolves them locally.
     pub fn parse(url: &str) -> anyhow::Result<Self> {
         let url = ::url::Url::parse(url).context("invalid proxy URL")?;
-        match url.scheme() {
-            "socks5" | "socks5h" => {}
+        let kind = match url.scheme() {
+            "socks5" | "socks5h" => ProxyKind::Socks5,
+            "http" => ProxyKind::Http,
             other => anyhow::bail!("unsupported proxy URL scheme \"{other}\""),
-        }
+        };
         let host = url.host_str().context("missing host")?;
         let port = url.port().context("missing port")?;
         let up = url
             .password()
             .map(|p| (url.username().to_owned(), p.to_owned()));
         Ok(Self {
+            kind,
             host: host.to_owned(),
             port,
             username_password: up,
@@ -98,12 +161,16 @@ impl SocksProxyConfig {
     async fn connect(
         &self,
         addr: SocketAddr,
-    ) -> tokio_socks::Result<(
+    ) -> Result<(
         impl tokio::io::AsyncRead + Unpin + 'static,
         impl tokio::io::AsyncWrite + Unpin + 'static,
     )> {
         let proxy_addr = (self.host.as_str(), self.port);
 
+        if self.kind == ProxyKind::Http {
+            let stream: Box<dyn ProxyStream> = Box::new(http_connect(self, addr).await.map_err(Error::Anyhow)?);
+            return Ok(tokio::io::split(stream));
+        }
         let stream = if let Some((username, password)) = self.username_password.as_ref() {
             tokio_socks::tcp::Socks5Stream::connect_with_password(
                 proxy_addr,
@@ -115,7 +182,7 @@ impl SocksProxyConfig {
         } else {
             tokio_socks::tcp::Socks5Stream::connect(proxy_addr, addr).await?
         };
-
+        let stream: Box<dyn ProxyStream> = Box::new(stream);
         Ok(tokio::io::split(stream))
     }
 }
@@ -246,7 +313,7 @@ impl StreamConnector {
             let (r, w) = self
                 .with_stat(ConnectionKind::Socks, addr.is_ipv6(), proxy.connect(addr))
                 .await?;
-            debug!(?addr, "connected through SOCKS5");
+            debug!(?addr, kind = ?proxy.kind, "connected through the proxy");
             return Ok((
                 ConnectionKind::Socks,
                 Box::new(r.into_vectored_compat()),
@@ -372,10 +439,19 @@ mod tests {
         );
     }
 
+    // qbt-rs: http:// is an HTTP CONNECT proxy now.
+    #[test]
+    fn test_parse_http() {
+        let c = SocksProxyConfig::parse("http://u:p@myhost:1234").unwrap();
+        assert_eq!(c.kind, ProxyKind::Http);
+        assert_eq!((c.host.as_str(), c.port), ("myhost", 1234));
+        assert_eq!(c.username_password, Some(("u".into(), "p".into())));
+    }
+
     #[test]
     fn test_parse_rejects_other_schemes() {
         for url in [
-            "http://myhost:1234",
+            "https://myhost:1234",
             "socks4://myhost:1234",
             "socks4a://myhost:1234",
         ] {

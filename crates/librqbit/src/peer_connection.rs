@@ -2,6 +2,7 @@
 //   - outgoing connections: encrypted (MSE/PE) handshake per ConnectionOptions::encryption.
 //   - 2026-11-22: PeerConnectionHandler::on_encrypted() reports the MSE/PE result.
 //   - 2026-11-21: WriterRequest::Hashes, the answer to a BitTorrent v2 hash request (BEP 52).
+//   - 2026-11-22: an empty client name leaves "v" out of the extended handshake (anonymous mode).
 //   - 2026-11-22: the Fast extension (BEP 6): when both sides support it, the first message is a
 //     bitfield, "have all" or "have none" (serialize_bitfield_message_to_buf gets `fast`).
 // Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
@@ -379,7 +380,9 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
 
         if supports_extended {
             let mut my_extended = ExtendedHandshake::new();
-            my_extended.v = Some(ByteBuf(self.handler.client_name_and_version().as_bytes()));
+            // qbt-rs: no client version in anonymous mode (the name is empty then).
+            let name = self.handler.client_name_and_version();
+            my_extended.v = (!name.is_empty()).then_some(ByteBuf(name.as_bytes()));
             my_extended.yourip = Some(self.addr.ip().into());
             self.handler
                 .update_my_extended_handshake(&mut my_extended)

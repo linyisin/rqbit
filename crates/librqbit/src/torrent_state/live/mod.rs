@@ -25,6 +25,10 @@
 //     reject request (sent to choked or invalid requests, and for queued requests once a peer is
 //     choked; received ones give the piece back), allowed fast in both directions; suggest piece
 //     is accepted and ignored.
+//   - 2026-11-22: peer exchange can be turned off for the session (SessionOptions::disable_pex).
+//   - 2026-11-22: connection limits per torrent and for the session that can change while running
+//     (crate::connection_limit, Session::set_connection_limits).
+//   - 2026-11-22: disconnect_peers (a new IP filter, Session::set_ip_filter).
 //   - 2026-11-22: super seeding (BEP 16, libtorrent's non-strict mode): set_super_seeding; peers
 //     that connect while we super seed see no pieces, then two at a time (rarest first); "not
 //     interested" is now recorded; "have" is sent to peers that have the piece too (libtorrent's
@@ -112,7 +116,7 @@ use peer_binary_protocol::{
     },
 };
 use tokio::sync::{
-    Notify, OwnedSemaphorePermit, Semaphore,
+    Notify,
     mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
 };
 use tokio_util::sync::CancellationToken;
@@ -235,7 +239,8 @@ pub struct TorrentStateLive {
     lengths: Lengths,
 
     // Limits how many active (occupying network resources) peers there are at a moment in time.
-    peer_semaphore: Arc<Semaphore>,
+    /// qbt-rs: this torrent's connection limit (resizable, crate::connection_limit).
+    peer_limit: crate::connection_limit::ConnectionLimit,
 
     // The queue for peer manager to connect to them.
     peer_queue_tx: UnboundedSender<SocketAddr>,
@@ -333,9 +338,9 @@ impl TorrentStateLive {
                 ..Default::default()
             },
             lengths,
-            peer_semaphore: Arc::new(Semaphore::new(
-                paused.shared.options.peer_limit.unwrap_or(128),
-            )),
+            peer_limit: crate::connection_limit::ConnectionLimit::new(paused.shared.options.peer_limit.or_else(|| {
+                paused.shared.session.upgrade().map_or(Some(128), |s| *s.torrent_connections.read())
+            })),
             new_pieces_notify: Notify::new(),
             peer_queue_tx,
             finished_notify: Notify::new(),
@@ -424,9 +429,11 @@ impl TorrentStateLive {
     ) -> anyhow::Result<AddIncomingPeerResult> {
         use dashmap::mapref::entry::Entry;
         let (tx, rx) = unbounded_channel();
-        let permit = match self.peer_semaphore.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => {
+        // qbt-rs: the torrent's and the session's connection limits.
+        let global = self.shared.session.upgrade().and_then(|s| s.global_connections.try_acquire());
+        let permit = match (self.peer_limit.try_acquire(), global) {
+            (Some(torrent), Some(global)) => crate::connection_limit::PeerPermit::new(torrent, global),
+            _ => {
                 debug!("limit of live peers reached, dropping incoming peer");
                 self.peers.with_peer(checked_peer.addr, |p| {
                     atomic_inc(&p.stats.counters.incoming_connections);
@@ -549,7 +556,7 @@ impl TorrentStateLive {
         counters: Arc<AtomicPeerCounters>,
         tx: PeerTx,
         rx: PeerRx,
-        permit: OwnedSemaphorePermit,
+        permit: crate::connection_limit::PeerPermit,
     ) -> crate::Result<()> {
         {
             use super::live::peer::stats::atomic::conn_flags;
@@ -617,7 +624,7 @@ impl TorrentStateLive {
     async fn task_manage_outgoing_peer(
         self: Arc<Self>,
         addr: SocketAddr,
-        permit: OwnedSemaphorePermit,
+        permit: crate::connection_limit::PeerPermit,
     ) -> crate::Result<()> {
         let state = self;
         let (rx, tx) = state.peers.mark_peer_connecting(addr)?;
@@ -718,7 +725,7 @@ impl TorrentStateLive {
                 continue;
             }
 
-            if session.blocklist.has(addr.ip()) {
+            if session.blocklist.load().has(addr.ip()) {
                 session
                     .stats
                     .counters
@@ -742,7 +749,11 @@ impl TorrentStateLive {
                 continue;
             }
 
-            let permit = state.peer_semaphore.clone().acquire_owned().await?;
+            let torrent_permit = state.peer_limit.acquire().await?;
+            let Some(session) = state.shared.session.upgrade() else { return Ok(()) };
+            let global_permit = session.global_connections.acquire().await?;
+            drop(session);
+            let permit = crate::connection_limit::PeerPermit::new(torrent_permit, global_permit);
             state.spawn(
                 debug_span!(parent: state.shared.span.clone(), "manage_peer", peer = ?addr),
                 format!("[{}][addr={addr}]manage_peer", state.shared.id),
@@ -1013,6 +1024,31 @@ impl TorrentStateLive {
         }
     }
 
+    /// qbt-rs: disconnects the live peers whose IP matches `blocked` (a new IP filter). Returns how
+    /// many.
+    pub(crate) fn disconnect_peers(&self, blocked: impl Fn(IpAddr) -> bool) -> usize {
+        let mut count = 0;
+        for e in self.peers.states.iter() {
+            if let Some(live) = e.value().get_live()
+                && blocked(e.key().ip().to_canonical())
+                && live.tx.send(WriterRequest::Disconnect(Ok(()))).is_ok()
+            {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// qbt-rs: changes this torrent's connection limit (`None` = unlimited).
+    pub(crate) fn set_peer_limit(&self, limit: Option<usize>) {
+        self.peer_limit.set(limit);
+    }
+
+    /// qbt-rs: peer exchange isn't turned off for the session.
+    pub(crate) fn pex_enabled_for_session(&self) -> bool {
+        self.shared.session.upgrade().is_none_or(|s| !s.disable_pex)
+    }
+
     /// qbt-rs: super seeding is on and we are a seed (libtorrent turns it off otherwise).
     pub(crate) fn super_seeding_active(&self) -> bool {
         if !self.super_seeding.load(Ordering::Relaxed) {
@@ -1127,6 +1163,12 @@ impl TorrentStateLive {
         for addr in idle {
             self.offer_super_seed_piece(addr, None);
         }
+    }
+
+    /// qbt-rs: every peer address this torrent knows (tests).
+    #[cfg(test)]
+    pub(crate) fn known_peers(&self) -> Vec<SocketAddr> {
+        self.peers.states.iter().map(|e| *e.key()).collect()
     }
 
     /// qbt-rs: the pieces `addr` told us it has (tests).
@@ -1691,6 +1733,9 @@ impl PeerConnectionHandler for &'_ PeerHandler {
                 self.require_fast("suggest piece")?;
                 trace!(index, "received suggest piece; suggestions are only advisory, ignoring");
             }
+            Message::Extended(ExtendedMessage::UtPex(_)) if !self.state.pex_enabled_for_session() => {
+                trace!("peer exchange is off, ignoring PEX message");
+            }
             Message::Extended(ExtendedMessage::UtPex(pex)) => {
                 if self.state.metadata.info.info().private {
                     warn!(
@@ -1781,7 +1826,7 @@ impl PeerConnectionHandler for &'_ PeerHandler {
             }
         }
 
-        if !self.state.metadata.info.info().private && hs.m.ut_pex.is_some() {
+        if !self.state.metadata.info.info().private && hs.m.ut_pex.is_some() && self.state.pex_enabled_for_session() {
             spawn_with_cancel(
                 debug_span!(
                     parent: self.state.shared.span.clone(),
@@ -1846,6 +1891,10 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         &self,
         handshake: &mut ExtendedHandshake<ByteBuf>,
     ) -> anyhow::Result<()> {
+        // qbt-rs: don't offer PEX when it is off.
+        if !self.state.pex_enabled_for_session() {
+            handshake.m.ut_pex = None;
+        }
         let info_bytes = &self.state.metadata.info_bytes;
         if !info_bytes.is_empty()
             && let Ok(len) = info_bytes.len().try_into()

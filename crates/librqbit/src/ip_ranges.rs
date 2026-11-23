@@ -1,3 +1,7 @@
+// Modified by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-22: has() checks IPv4-mapped
+// IPv6 addresses against the IPv4 ranges.
+// Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
+
 use anyhow::{Context, Result};
 use async_compression::tokio::bufread::GzipDecoder;
 use futures::TryStreamExt;
@@ -139,7 +143,8 @@ impl IpRanges {
     }
 
     pub fn has(&self, ip: IpAddr) -> bool {
-        match ip {
+        // qbt-rs: IPv4-mapped IPv6 addresses (from dual-stack sockets) are checked as IPv4.
+        match ip.to_canonical() {
             IpAddr::V4(a) => self.v4.t.query_point(a).next().is_some(),
             IpAddr::V6(a) => self.v6.t.query_point(a).next().is_some(),
         }
@@ -209,6 +214,14 @@ mod tests {
         assert!(!list.has("8.8.8.8".parse().unwrap()));
 
         Ok(())
+    }
+
+    #[test]
+    fn test_mapped_v4_is_checked_as_v4() {
+        let list = IpRanges::new(std::iter::once(Ipv4Addr::new(10, 0, 0, 0)..Ipv4Addr::new(10, 0, 1, 0)), []);
+        assert!(list.has("10.0.0.5".parse().unwrap()));
+        assert!(list.has("::ffff:10.0.0.5".parse().unwrap()));
+        assert!(!list.has("::ffff:10.0.1.0".parse().unwrap()));
     }
 
     #[tokio::test]

@@ -17,6 +17,15 @@
 //   - 2026-11-22: v2-only magnet links ("btmh" only): found under the truncated v2 hash, the
 //     metadata is checked with SHA-256 and the piece layers come from the same peer.
 //   - 2026-11-22: the choker task and upload slots (set_upload_slots, choke_interval option).
+//   - 2026-11-22: SessionOptions::disable_pex (peer exchange off, like qBittorrent's setting).
+//   - 2026-11-22: connection limits that can change while running (set_connection_limits).
+//   - 2026-11-22: AddTorrentOptions::trackers also apply to magnet links and not to private
+//     torrents.
+//   - 2026-11-22: the blocklist can be replaced while running (set_ip_filter), disconnecting
+//     peers it now blocks.
+//   - 2026-11-22: SessionOptions::anonymous_mode (libtorrent's anonymous_mode): a generic
+//     User-Agent for trackers of public torrents and for web seeds, and no client version in
+//     extension handshakes.
 // Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
 
 use std::{
@@ -142,6 +151,11 @@ pub struct Session {
     pub external_ip: crate::external_ip::ExternalIpVoter,
     /// qbt-rs: upload slots for the choker (crate::choker).
     pub(crate) upload_slots: crate::choker::UploadSlots,
+    /// qbt-rs: peer connections of the whole session.
+    pub(crate) global_connections: crate::connection_limit::ConnectionLimit,
+    /// qbt-rs: the per-torrent connection limit for torrents that don't set their own
+    /// (`AddTorrentOptions::peer_limit`); `None` = unlimited.
+    pub(crate) torrent_connections: parking_lot::RwLock<Option<usize>>,
     pub(crate) connector: Arc<StreamConnector>,
     pub(crate) reqwest_client: reqwest::Client,
     udp_tracker_client: UdpTrackerClient,
@@ -164,7 +178,8 @@ pub struct Session {
     pub(crate) concurrent_initialize_semaphore: Arc<tokio::sync::Semaphore>,
     pub ratelimits: Limits,
 
-    pub blocklist: IpRanges,
+    /// qbt-rs: replaceable while running (set_ip_filter).
+    pub blocklist: arc_swap::ArcSwap<IpRanges>,
     pub allowlist: Option<IpRanges>,
 
     // Monitoring / tracing / logging
@@ -177,6 +192,11 @@ pub struct Session {
     pub ipv4_only: bool,
     pub peer_limit: Option<usize>,
     client_name_and_version: String,
+    /// qbt-rs: peer exchange is off.
+    pub(crate) disable_pex: bool,
+    /// qbt-rs: anonymous mode, and the HTTP client with a generic User-Agent it uses.
+    pub(crate) anonymous_mode: bool,
+    pub(crate) anonymous_reqwest_client: reqwest::Client,
 }
 
 /// A 40 character hex string is a v1 info hash. Checking the length alone
@@ -454,6 +474,9 @@ impl Default for DhtSessionConfig {
     }
 }
 
+/// qbt-rs: libtorrent's User-Agent in anonymous mode (http_tracker_connection.cpp).
+const ANONYMOUS_USER_AGENT: &str = "curl/7.81.0";
+
 pub struct SessionOptions {
     /// DHT configuration. Set to None to disable DHT entirely.
     /// Defaults to DHT enabled with persistence.
@@ -522,6 +545,12 @@ pub struct SessionOptions {
     /// qbt-rs: how often the choker recalculates the unchoked peers (default 15 s,
     /// libtorrent's unchoke_interval; tests use shorter intervals).
     pub choke_interval: Option<Duration>,
+
+    /// qbt-rs: turn off peer exchange (ut_pex, BEP 11): it is neither advertised, sent nor used.
+    pub disable_pex: bool,
+
+    /// qbt-rs: libtorrent's anonymous_mode (qBittorrent's "Enable anonymous mode").
+    pub anonymous_mode: bool,
 }
 
 impl Default for SessionOptions {
@@ -551,6 +580,8 @@ impl Default for SessionOptions {
             ipv4_only: false,
             client_name_and_version: None,
             choke_interval: None,
+            disable_pex: false,
+            anonymous_mode: false,
         }
     }
 }
@@ -775,10 +806,12 @@ impl Session {
                 .client_name_and_version
                 .unwrap_or_else(|| crate::client_name_and_version().to_owned());
 
-            let reqwest_client = {
+            // qbt-rs: the same client twice, the second one with libtorrent's generic User-Agent
+            // for anonymous mode.
+            let build_client = |user_agent: &str| -> anyhow::Result<reqwest::Client> {
                 let builder = if let Some(proxy_url) = proxy_url {
                     let proxy = reqwest::Proxy::all(proxy_url)
-                        .context("error creating socks5 proxy for HTTP")?;
+                        .context("error creating the proxy for HTTP requests")?;
                     reqwest::Client::builder().proxy(proxy)
                 } else {
                     #[allow(unused_mut)]
@@ -790,16 +823,17 @@ impl Session {
                     b
                 };
 
-                builder
-                    .user_agent(&client_name_and_version)
-                    .build()
-                    .context("error building HTTP(S) client")?
+                builder.user_agent(user_agent).build().context("error building HTTP(S) client")
             };
+            let reqwest_client = build_client(&client_name_and_version)?;
+            let anonymous_reqwest_client = build_client(ANONYMOUS_USER_AGENT)?;
 
             let stream_connector = Arc::new(
                 StreamConnector::new(StreamConnectorArgs {
                     enable_tcp: opts.connect.as_ref().map(|c| c.enable_tcp).unwrap_or(true),
-                    socks_proxy_config: proxy_config,
+                    // qbt-rs: the proxy may be for tracker requests only.
+                    socks_proxy_config: proxy_config
+                        .filter(|_| !opts.connect.as_ref().is_some_and(|c| c.proxy_trackers_only)),
                     utp_socket: listen_result.as_ref().and_then(|l| l.utp_socket.clone()),
                     bind_device: bind_device.clone(),
                     ipv4_only: opts.ipv4_only,
@@ -857,6 +891,8 @@ impl Session {
                 dht,
                 external_ip: Default::default(),
                 upload_slots: Default::default(),
+                global_connections: crate::connection_limit::ConnectionLimit::new(None),
+                torrent_connections: parking_lot::RwLock::new(opts.peer_limit.or(Some(128))),
                 peer_opts,
                 spawner: spawner.clone(),
                 output_folder: default_output_folder,
@@ -881,10 +917,13 @@ impl Session {
                 disable_trackers: opts.disable_trackers,
                 peer_limit: opts.peer_limit,
                 client_name_and_version,
+                disable_pex: opts.disable_pex,
+                anonymous_mode: opts.anonymous_mode,
+                anonymous_reqwest_client,
 
                 #[cfg(feature = "disable-upload")]
                 _disable_upload: opts.disable_upload,
-                blocklist,
+                blocklist: arc_swap::ArcSwap::from_pointee(blocklist),
                 allowlist,
                 lsd,
             });
@@ -1019,7 +1058,7 @@ impl Session {
             .unwrap_or_else(|| Duration::from_secs(10));
 
         let incoming_ip = addr.ip();
-        if self.blocklist.has(incoming_ip) {
+        if self.blocklist.load().has(incoming_ip) {
             self.stats
                 .counters
                 .blocked_incoming
@@ -1230,6 +1269,56 @@ impl Session {
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 
+    /// qbt-rs: the client name for extension handshakes; empty (left out) in anonymous mode.
+    pub(crate) fn peer_client_name(&self) -> String {
+        if self.anonymous_mode { String::new() } else { self.client_name_and_version.clone() }
+    }
+
+    /// qbt-rs: the HTTP client for web seeds (a generic User-Agent in anonymous mode).
+    pub(crate) fn web_seed_client(&self) -> reqwest::Client {
+        if self.anonymous_mode { self.anonymous_reqwest_client.clone() } else { self.reqwest_client.clone() }
+    }
+
+    /// qbt-rs: replaces the blocklist (qBittorrent's IP filter and banned IPs) with these inclusive
+    /// ranges, and disconnects connected peers it blocks. Returns how many were disconnected.
+    pub fn set_ip_filter(&self, ranges: impl IntoIterator<Item = std::ops::RangeInclusive<std::net::IpAddr>>) -> usize {
+        let (mut v4, mut v6) = (Vec::new(), Vec::new());
+        for range in ranges {
+            match (*range.start(), *range.end()) {
+                (std::net::IpAddr::V4(a), std::net::IpAddr::V4(b)) if a <= b => {
+                    v4.push(a..std::net::Ipv4Addr::from_bits(b.to_bits().saturating_add(1)))
+                }
+                (std::net::IpAddr::V6(a), std::net::IpAddr::V6(b)) if a <= b => {
+                    v6.push(a..std::net::Ipv6Addr::from_bits(b.to_bits().saturating_add(1)))
+                }
+                _ => {}
+            }
+        }
+        let list = Arc::new(IpRanges::new(v4, v6));
+        self.blocklist.store(list.clone());
+        let lives: Vec<_> = self.with_torrents(|it| it.filter_map(|(_, t)| t.live()).collect());
+        lives.iter().map(|live| live.disconnect_peers(|ip| list.has(ip))).sum()
+    }
+
+    /// qbt-rs: the most peer connections (`None` = unlimited) for the whole session and per
+    /// torrent (qBittorrent's MaxConnections / MaxConnectionsPerTorrent, defaults 500 and 100).
+    /// Applies right away; lowering a limit doesn't drop connections, new ones wait until the
+    /// count is below it. Torrents added with their own `peer_limit` keep it.
+    pub fn set_connection_limits(&self, global: Option<usize>, per_torrent: Option<usize>) {
+        self.global_connections.set(global);
+        *self.torrent_connections.write() = per_torrent;
+        let lives: Vec<_> = self.with_torrents(|it| it.filter_map(|(_, t)| t.live()).collect());
+        for live in lives {
+            if live.torrent().options.peer_limit.is_none() {
+                live.set_peer_limit(per_torrent);
+            }
+        }
+    }
+
+    pub fn connection_limits(&self) -> (Option<usize>, Option<usize>) {
+        (self.global_connections.get(), *self.torrent_connections.read())
+    }
+
     /// qbt-rs: upload slots (`None` = unlimited) for the whole session and per torrent;
     /// defaults to qBittorrent's 20 and 4.
     pub fn set_upload_slots(&self, global: Option<u32>, per_torrent: Option<u32>) {
@@ -1280,9 +1369,11 @@ impl Session {
                     InternalAddResult {
                         info_hash,
                         info_hash_v2: magnet_v2,
+                        // qbt-rs: custom trackers are added to magnet links too (qBittorrent does).
                         trackers: magnet
                             .trackers
                             .into_iter()
+                            .chain(opts.trackers.clone().unwrap_or_default())
                             .filter_map(|t| url::Url::parse(&t).ok())
                             .collect(),
                         // qbt-rs: "ws" parameters (BEP 19) of the magnet link.
@@ -1326,7 +1417,11 @@ impl Session {
                             }
                         })
                         .collect::<Vec<_>>();
-                    if let Some(custom_trackers) = opts.trackers.clone() {
+                    // qbt-rs: like qBittorrent's "automatically add these trackers", not for
+                    // private torrents.
+                    if let Some(custom_trackers) = opts.trackers.clone()
+                        && !torrent.meta.info.data.private
+                    {
                         trackers.extend(custom_trackers);
                     }
 
@@ -1526,7 +1621,9 @@ impl Session {
                     allow_overwrite: opts.overwrite,
                     output_folder: RwLock::new(output_folder),
                     initial_peers: opts.initial_peers.clone().unwrap_or_default(),
-                    peer_limit: opts.peer_limit.or(self.peer_limit),
+                    // qbt-rs: only the torrent's own limit; otherwise the session's current
+                    // per-torrent limit applies (set_connection_limits).
+                    peer_limit: opts.peer_limit,
                     #[cfg(feature = "disable-upload")]
                     _disable_upload: self._disable_upload,
                 },
@@ -1535,7 +1632,7 @@ impl Session {
                 connector: self.connector.clone(),
                 session: Arc::downgrade(self),
                 magnet_name: name,
-                client_name_and_version: self.client_name_and_version.clone(),
+                client_name_and_version: self.peer_client_name(),
             });
 
             let initializing = Arc::new(TorrentStateInitializing::new(
@@ -1767,7 +1864,13 @@ impl Session {
             Box::new(tracker_rx_stats),
             force_tracker_interval,
             self.announce_port().unwrap_or(4240),
-            self.reqwest_client.clone(),
+            // qbt-rs: anonymous mode hides the client from public torrents' trackers (libtorrent
+            // keeps the real User-Agent for private trackers, some require it).
+            if self.anonymous_mode && !is_private {
+                self.anonymous_reqwest_client.clone()
+            } else {
+                self.reqwest_client.clone()
+            },
             self.udp_tracker_client.clone(),
             tracker_statuses,
         )
@@ -1964,7 +2067,7 @@ impl Session {
             peer_rx,
             Some(self.merge_peer_opts(peer_opts)),
             self.connector.clone(),
-            self.client_name_and_version.clone(),
+            self.peer_client_name(),
         )
         .await
         {
