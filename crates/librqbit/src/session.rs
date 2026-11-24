@@ -23,6 +23,8 @@
 //     torrents.
 //   - 2026-11-22: the blocklist can be replaced while running (set_ip_filter), disconnecting
 //     peers it now blocks.
+//   - 2026-11-24: the session's rate limits can skip uTP and local network peers
+//     (set_rate_limit_scope).
 //   - 2026-11-22: SessionOptions::anonymous_mode (libtorrent's anonymous_mode): a generic
 //     User-Agent for trackers of public torrents and for web seeds, and no client version in
 //     extension handshakes.
@@ -197,6 +199,9 @@ pub struct Session {
     /// qbt-rs: anonymous mode, and the HTTP client with a generic User-Agent it uses.
     pub(crate) anonymous_mode: bool,
     pub(crate) anonymous_reqwest_client: reqwest::Client,
+    /// qbt-rs: whether the session's rate limits apply to uTP and to local network peers.
+    rate_limit_utp: std::sync::atomic::AtomicBool,
+    rate_limit_lan: std::sync::atomic::AtomicBool,
 }
 
 /// A 40 character hex string is a v1 info hash. Checking the length alone
@@ -920,6 +925,8 @@ impl Session {
                 disable_pex: opts.disable_pex,
                 anonymous_mode: opts.anonymous_mode,
                 anonymous_reqwest_client,
+                rate_limit_utp: std::sync::atomic::AtomicBool::new(true),
+                rate_limit_lan: std::sync::atomic::AtomicBool::new(true),
 
                 #[cfg(feature = "disable-upload")]
                 _disable_upload: opts.disable_upload,
@@ -1267,6 +1274,21 @@ impl Session {
         self.cancellation_token.cancel();
         // this sucks, but hopefully will be enough
         tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    /// qbt-rs: whether the session's rate limits apply to uTP peers and to peers on the local
+    /// network (qBittorrent's "Apply rate limit to µTP protocol" / "to peers on LAN", both on by
+    /// default). Per-torrent limits always apply.
+    pub fn set_rate_limit_scope(&self, utp: bool, lan: bool) {
+        self.rate_limit_utp.store(utp, std::sync::atomic::Ordering::Relaxed);
+        self.rate_limit_lan.store(lan, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn rate_limit_scope(&self) -> (bool, bool) {
+        (
+            self.rate_limit_utp.load(std::sync::atomic::Ordering::Relaxed),
+            self.rate_limit_lan.load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     /// qbt-rs: the client name for extension handshakes; empty (left out) in anonymous mode.

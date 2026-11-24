@@ -74,3 +74,31 @@ async fn ip_filter() -> anyhow::Result<()> {
     seeder.session.stop().await;
     Ok(())
 }
+
+/// qbt-rs: Session::set_rate_limit_scope: with "apply to LAN peers" off, the session's upload
+/// limit no longer slows a peer on 127.0.0.1.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_session_limit_can_skip_lan_peers() -> anyhow::Result<()> {
+    timeout(Duration::from_secs(120), lan_scope()).await.context("test timed out")?
+}
+
+async fn lan_scope() -> anyhow::Result<()> {
+    super::test_util::setup_test_logging();
+    let seeder = seeder().await?;
+    seeder.session.ratelimits.set_upload_bps(std::num::NonZeroU32::new(32 * 1024));
+    assert_eq!(seeder.session.rate_limit_scope(), (true, true), "both on by default (qBittorrent)");
+    let (session, handle, _dir) = leecher(&seeder, None).await?;
+    let progress = || handle.stats().progress_bytes;
+    poll("download started", Duration::from_secs(20), || (progress() > 0).then_some(())).await?;
+    let start = progress();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    // 32 KiB/s for 2 s, with generous slack for bursts.
+    assert!(progress() - start < 256 * 1024, "limited: {} bytes in 2 s", progress() - start);
+
+    seeder.session.set_rate_limit_scope(true, false);
+    // The rest (most of 512 KiB) would take over 10 s at 32 KiB/s.
+    timeout(Duration::from_secs(5), handle.wait_until_completed()).await.context("LAN peer still limited")??;
+    session.stop().await;
+    seeder.session.stop().await;
+    Ok(())
+}

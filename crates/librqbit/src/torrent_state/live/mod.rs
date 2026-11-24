@@ -29,6 +29,8 @@
 //   - 2026-11-22: connection limits per torrent and for the session that can change while running
 //     (crate::connection_limit, Session::set_connection_limits).
 //   - 2026-11-22: disconnect_peers (a new IP filter, Session::set_ip_filter).
+//   - 2026-11-24: the session's rate limits can skip uTP and local network peers
+//     (Session::set_rate_limit_scope, libtorrent's peer classes); torrent limits still apply.
 //   - 2026-11-22: super seeding (BEP 16, libtorrent's non-strict mode): set_super_seeding; peers
 //     that connect while we super seed see no pieces, then two at a time (rarest first); "not
 //     interested" is now recorded; "have" is sent to peers that have the piece too (libtorrent's
@@ -535,7 +537,9 @@ impl TorrentStateLive {
                     res?;
                 }
             };
-            if let Some(session) = self.shared.session.upgrade() {
+            if let Some(session) = self.shared.session.upgrade()
+                && self.session_limits_apply(&session, addr)
+            {
                 tokio::select! {
                     _ = tx.closed() => {
                         continue;
@@ -1037,6 +1041,19 @@ impl TorrentStateLive {
             }
         }
         count
+    }
+
+    /// qbt-rs: whether the session-wide rate limits apply to this peer (qBittorrent's "Apply rate
+    /// limit to µTP protocol" / "to peers on LAN").
+    pub(crate) fn session_limits_apply(&self, session: &crate::Session, addr: PeerHandle) -> bool {
+        let (utp, lan) = session.rate_limit_scope();
+        if !lan && is_local_network(addr.ip()) {
+            return false;
+        }
+        if !utp && self.peers.with_live(addr, |l| matches!(l.connection_kind, ConnectionKind::Utp)).unwrap_or(false) {
+            return false;
+        }
+        true
     }
 
     /// qbt-rs: changes this torrent's connection limit (`None` = unlimited).
@@ -2542,7 +2559,9 @@ impl PeerHandler {
         // takes bandwidth quota before reading from the socket).
         if let Some(len) = NonZeroU32::new(length) {
             self.state.ratelimits.prepare_for_download(len).await?;
-            if let Some(session) = self.state.torrent().session.upgrade() {
+            if let Some(session) = self.state.torrent().session.upgrade()
+                && self.state.session_limits_apply(&session, self.addr)
+            {
                 session.ratelimits.prepare_for_download(len).await?;
             }
         }
@@ -2955,6 +2974,29 @@ impl PeerHandler {
     }
 }
 
+/// qbt-rs: libtorrent's `is_local` (ip_helpers.cpp): private, link-local, loopback and CGNAT IPv4;
+/// loopback, link-local, site-local and unique local IPv6.
+fn is_local_network(ip: IpAddr) -> bool {
+    match ip.to_canonical() {
+        IpAddr::V4(a) => {
+            let ip = u32::from(a);
+            (ip & 0xff00_0000) == 0x0a00_0000
+                || (ip & 0xfff0_0000) == 0xac10_0000
+                || (ip & 0xffff_0000) == 0xc0a8_0000
+                || (ip & 0xffff_0000) == 0xa9fe_0000
+                || (ip & 0xff00_0000) == 0x7f00_0000
+                || (ip & 0xffc0_0000) == 0x6440_0000
+        }
+        IpAddr::V6(a) => {
+            let s = a.segments();
+            a.is_loopback()
+                || (s[0] & 0xffc0) == 0xfe80
+                || (s[0] & 0xffc0) == 0xfec0
+                || (s[0] & 0xfe00) == 0xfc00
+        }
+    }
+}
+
 fn format_peer_client_name(value: &ByteBuf<'_>) -> Option<String> {
     let client_name = String::from_utf8_lossy(value.as_ref()).trim().to_string();
     if client_name.is_empty() {
@@ -2962,4 +3004,19 @@ fn format_peer_client_name(value: &ByteBuf<'_>) -> Option<String> {
     }
 
     Some(client_name)
+}
+
+#[cfg(test)]
+mod local_network_tests {
+    use super::is_local_network;
+
+    #[test]
+    fn libtorrent_is_local() {
+        for ip in ["10.1.2.3", "172.16.0.1", "172.31.255.255", "192.168.1.1", "169.254.0.1", "127.0.0.1", "100.64.0.1", "::1", "fe80::1", "fec0::1", "fd00::1", "::ffff:192.168.0.2"] {
+            assert!(is_local_network(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in ["8.8.8.8", "172.32.0.1", "100.128.0.1", "2001:db8::1", "::ffff:8.8.8.8"] {
+            assert!(!is_local_network(ip.parse().unwrap()), "{ip}");
+        }
+    }
 }
