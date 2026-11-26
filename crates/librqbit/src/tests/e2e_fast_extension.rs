@@ -31,7 +31,7 @@ pub(super) struct Seeder {
     pub session: std::sync::Arc<Session>,
     pub handle: std::sync::Arc<ManagedTorrent>,
     pub addr: SocketAddr,
-    bytes: bytes::Bytes,
+    pub bytes: bytes::Bytes,
     _dir: tempfile::TempDir,
 }
 

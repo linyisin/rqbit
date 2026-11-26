@@ -28,6 +28,8 @@
 //   - 2026-11-22: SessionOptions::anonymous_mode (libtorrent's anonymous_mode): a generic
 //     User-Agent for trackers of public torrents and for web seeds, and no client version in
 //     extension handshakes.
+//   - 2026-11-24: AddTorrentOptions::excluded_file_names (qBittorrent's "excluded file names"),
+//     applied after a magnet link's metadata arrives too.
 // Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
 
 use std::{
@@ -248,13 +250,69 @@ fn compute_only_files_regex<ByteBuf: AsRef<[u8]>>(
     Ok(only_files)
 }
 
+/// qbt-rs: qBittorrent's "excluded file names" (`SessionImpl::applyFilenameFilter`). A file is
+/// not downloaded when a pattern matches its name or the name of any folder above it, including
+/// a multi-file torrent's own folder, or, with `without_extension`, when its name has no
+/// extension. Only used when neither `only_files` nor `only_files_regex` is given.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ExcludedFileNames {
+    /// Regular expressions, matched case-insensitively against whole names (callers anchor them;
+    /// qBittorrent turns its wildcards into anchored expressions).
+    pub patterns: Vec<String>,
+    #[serde(default)]
+    pub without_extension: bool,
+}
+
+impl ExcludedFileNames {
+    fn only_files<ByteBuf: AsRef<[u8]>>(
+        &self,
+        info: &ValidatedTorrentMetaV1Info<ByteBuf>,
+    ) -> anyhow::Result<Option<Vec<usize>>> {
+        let patterns = self
+            .patterns
+            .iter()
+            .map(|p| {
+                regex::RegexBuilder::new(p)
+                    .case_insensitive(true)
+                    .build()
+                    .with_context(|| format!("excluded file name pattern {p:?} is incorrect"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let root = info.info().files.as_ref().and(info.name());
+        let mut keep = Vec::new();
+        let mut excluded_any = false;
+        for (idx, fd) in info.iter_file_details().enumerate() {
+            let mut names: Vec<String> = root.iter().map(|r| r.to_string()).collect();
+            names.extend(fd.filename.iter_components().map(|c| c.into_owned()));
+            let file_name = names.last().map(String::as_str).unwrap_or_default();
+            // qBittorrent `Path::extension`: a dot that isn't the last character.
+            let no_extension = !file_name
+                .char_indices()
+                .any(|(i, c)| c == '.' && i + 1 < file_name.len());
+            let excluded = (self.without_extension && no_extension)
+                || names.iter().any(|name| patterns.iter().any(|re| re.is_match(name)));
+            if excluded {
+                excluded_any = true;
+            } else {
+                keep.push(idx);
+            }
+        }
+        Ok(excluded_any.then_some(keep))
+    }
+}
+
 fn compute_only_files(
     info: &ValidatedTorrentMetaV1Info<ByteBufOwned>,
     only_files: Option<Vec<usize>>,
     only_files_regex: Option<String>,
+    excluded: Option<&ExcludedFileNames>,
     list_only: bool,
 ) -> anyhow::Result<Option<Vec<usize>>> {
     match (only_files, only_files_regex) {
+        (None, None) if excluded.is_some() => match excluded {
+            Some(excluded) => excluded.only_files(info),
+            None => Ok(None),
+        },
         (Some(_), Some(_)) => {
             bail!("only_files and only_files_regex are mutually exclusive");
         }
@@ -349,6 +407,10 @@ pub struct AddTorrentOptions {
 
     // Custom trackers
     pub trackers: Option<Vec<String>>,
+
+    /// qbt-rs: files not to download when neither `only_files` nor `only_files_regex` is set.
+    #[serde(default)]
+    pub excluded_file_names: Option<ExcludedFileNames>,
 
     /// qbt-rs: like qBittorrent's "save path": the folder under which the torrent's content is
     /// placed, still getting the default per-torrent subfolder for multi-file torrents (unlike
@@ -1553,6 +1615,7 @@ impl Session {
             &metadata.info,
             opts.only_files,
             opts.only_files_regex,
+            opts.excluded_file_names.as_ref(),
             opts.list_only,
         )?;
 

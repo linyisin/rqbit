@@ -90,6 +90,9 @@ async fn lan_scope() -> anyhow::Result<()> {
     let (session, handle, _dir) = leecher(&seeder, None).await?;
     let progress = || handle.stats().progress_bytes;
     poll("download started", Duration::from_secs(20), || (progress() > 0).then_some(())).await?;
+    // Let the rate limiter's initial burst pass before measuring (on a busy machine it could
+    // otherwise land inside the 2 s window).
+    tokio::time::sleep(Duration::from_secs(1)).await;
     let start = progress();
     tokio::time::sleep(Duration::from_secs(2)).await;
     // 32 KiB/s for 2 s, with generous slack for bursts.

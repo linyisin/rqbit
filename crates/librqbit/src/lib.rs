@@ -7,6 +7,7 @@
 //   - 2026-11-22: peer_source, external_ip and torrent_creator modules; PeerFlags re-export.
 //   - 2026-11-22: piece_picker, choker, fast_extension (BEP 6), natpmp (RFC 6886) and
 //     connection_limit modules.
+//   - 2026-11-24: ExcludedFileNames re-export.
 // Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
 
 //!
@@ -113,7 +114,8 @@ pub use librqbit_core::spawn_utils::spawn as librqbit_spawn;
 pub use listen::{ListenerMode, ListenerOptions};
 pub use peer_connection::PeerConnectionOptions;
 pub use session::{
-    AddTorrent, AddTorrentOptions, AddTorrentResponse, DhtSessionConfig, ListOnlyResponse,
+    AddTorrent, AddTorrentOptions, AddTorrentResponse, DhtSessionConfig, ExcludedFileNames,
+    ListOnlyResponse,
     SUPPORTED_SCHEMES, Session, SessionOptions, SessionPersistenceConfig,
 };
 pub use stream_connect::ConnectionOptions;

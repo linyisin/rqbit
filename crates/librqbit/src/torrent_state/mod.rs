@@ -15,6 +15,7 @@
 //   - 2026-11-22: ManagedTorrentShared::peer_sources (for qBittorrent's peer flags).
 //   - 2026-11-22: add_web_seed() / remove_web_seed().
 //   - 2026-11-22: handshake_info_hashes() (hybrid torrents also answer to the v2 hash).
+//   - 2026-11-26: connect_peer() (qBittorrent's "Add peers...", libtorrent's connect_peer).
 // Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
 
 pub mod initializing;
@@ -447,6 +448,14 @@ impl ManagedTorrent {
     }
 
     /// Get the live state if the torrent is live.
+    /// qbt-rs: connect to a peer the user typed in (qBittorrent's "Add peers...", libtorrent's
+    /// `torrent_handle::connect_peer`). Returns `Ok(false)` when the torrent already knows this
+    /// address. The torrent must be running; the IP filter still applies when connecting.
+    pub fn connect_peer(&self, addr: SocketAddr) -> anyhow::Result<bool> {
+        let live = self.live().context("the torrent isn't running")?;
+        Ok(live.add_peer_if_not_seen(addr)?)
+    }
+
     pub fn live(&self) -> Option<Arc<TorrentStateLive>> {
         let g = self.locked.read();
         match &g.state {
