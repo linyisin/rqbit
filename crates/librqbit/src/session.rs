@@ -30,6 +30,8 @@
 //     extension handshakes.
 //   - 2026-11-24: AddTorrentOptions::excluded_file_names (qBittorrent's "excluded file names"),
 //     applied after a magnet link's metadata arrives too.
+//   - 2026-11-26: take_blocked_peers(): peers the IP filter kept out or disconnected (for
+//     qBittorrent's "Blocked IPs" log, libtorrent's peer_blocked_alert).
 // Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
 
 use std::{
@@ -185,6 +187,8 @@ pub struct Session {
     /// qbt-rs: replaceable while running (set_ip_filter).
     pub blocklist: arc_swap::ArcSwap<IpRanges>,
     pub allowlist: Option<IpRanges>,
+    /// qbt-rs: recent peers the blocklist kept out (see take_blocked_peers).
+    pub(crate) blocked_peers: parking_lot::Mutex<std::collections::VecDeque<BlockedPeer>>,
 
     // Monitoring / tracing / logging
     pub(crate) stats: Arc<SessionStats>,
@@ -351,6 +355,23 @@ fn merge_two_optional_streams<T>(
         (Some(s1), Some(s2)) => Some(Box::pin(merge_streams(s1, s2))),
         (None, None) => None,
     }
+}
+
+/// qbt-rs: a peer the IP filter kept out (see Session::take_blocked_peers).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockedPeer {
+    pub addr: SocketAddr,
+    pub kind: BlockedPeerKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockedPeerKind {
+    /// It tried to connect to us.
+    Incoming,
+    /// We were about to connect to it (from a tracker, DHT, PEX...).
+    Outgoing,
+    /// It was connected and a new IP filter disconnected it.
+    Disconnected,
 }
 
 /// Options for adding new torrents to the session.
@@ -993,6 +1014,7 @@ impl Session {
                 #[cfg(feature = "disable-upload")]
                 _disable_upload: opts.disable_upload,
                 blocklist: arc_swap::ArcSwap::from_pointee(blocklist),
+                blocked_peers: parking_lot::Mutex::new(std::collections::VecDeque::new()),
                 allowlist,
                 lsd,
             });
@@ -1132,6 +1154,7 @@ impl Session {
                 .counters
                 .blocked_incoming
                 .fetch_add(1, Ordering::Relaxed);
+            self.note_blocked_peer(addr, BlockedPeerKind::Incoming);
             bail!("Incoming ip {incoming_ip} is in blocklist");
         }
         if self.allowlist.as_ref().is_some_and(|l| !l.has(incoming_ip)) {
@@ -1381,7 +1404,28 @@ impl Session {
         let list = Arc::new(IpRanges::new(v4, v6));
         self.blocklist.store(list.clone());
         let lives: Vec<_> = self.with_torrents(|it| it.filter_map(|(_, t)| t.live()).collect());
-        lives.iter().map(|live| live.disconnect_peers(|ip| list.has(ip))).sum()
+        let disconnected: Vec<SocketAddr> = lives.iter().flat_map(|live| live.disconnect_peers(|ip| list.has(ip))).collect();
+        for addr in &disconnected {
+            self.note_blocked_peer(*addr, BlockedPeerKind::Disconnected);
+        }
+        disconnected.len()
+    }
+
+    /// qbt-rs: remember a peer the blocklist kept out. Only the most recent ones are kept.
+    pub(crate) fn note_blocked_peer(&self, addr: SocketAddr, kind: BlockedPeerKind) {
+        const MAX_BLOCKED_PEERS: usize = 1000;
+        let mut list = self.blocked_peers.lock();
+        if list.len() >= MAX_BLOCKED_PEERS {
+            list.pop_front();
+        }
+        list.push_back(BlockedPeer { addr, kind });
+    }
+
+    /// qbt-rs: peers the IP filter kept out or disconnected since the last call, oldest first
+    /// (libtorrent's peer_blocked_alert with reason ip_filter, which qBittorrent shows in its
+    /// "Blocked IPs" log). At most the last 1000 are kept between calls.
+    pub fn take_blocked_peers(&self) -> Vec<BlockedPeer> {
+        self.blocked_peers.lock().drain(..).collect()
     }
 
     /// qbt-rs: the most peer connections (`None` = unlimited) for the whole session and per

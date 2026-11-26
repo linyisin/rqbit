@@ -55,8 +55,12 @@ async fn ip_filter() -> anyhow::Result<()> {
     poll("leecher connected", Duration::from_secs(20), || (live_peers() == 1).then_some(())).await?;
 
     let localhost: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+    assert!(seeder.session.take_blocked_peers().is_empty());
     let dropped = seeder.session.set_ip_filter([localhost..=localhost]);
     assert_eq!(dropped, 1, "the connected leecher is disconnected");
+    let blocked = seeder.session.take_blocked_peers();
+    assert_eq!(blocked.len(), 1);
+    assert_eq!((blocked[0].addr.ip(), blocked[0].kind), (localhost, crate::BlockedPeerKind::Disconnected));
     poll("leecher gone", Duration::from_secs(10), || (live_peers() == 0).then_some(())).await?;
     // The leecher retries (after its backoff) and is refused.
     poll("a blocked reconnect attempt", Duration::from_secs(60), || {
@@ -64,6 +68,41 @@ async fn ip_filter() -> anyhow::Result<()> {
         (seeder.session.stats_snapshot().counters.blocked_incoming > 0).then_some(())
     })
     .await?;
+    let blocked = seeder.session.take_blocked_peers();
+    assert!(blocked.iter().any(|b| b.addr.ip() == localhost && b.kind == crate::BlockedPeerKind::Incoming), "{blocked:?}");
+    assert!(seeder.session.take_blocked_peers().is_empty(), "taken");
+
+    // Outgoing: a session whose filter blocks the only peer it knows.
+    let dir = tempfile::TempDir::with_prefix("rqbit_blocked_out").unwrap();
+    let blocking = crate::Session::new_with_opts(
+        dir.path().to_owned(),
+        crate::SessionOptions {
+            dht: None,
+            persistence: None,
+            listen: None,
+            disable_local_service_discovery: true,
+            ..Default::default()
+        },
+    )
+    .await?;
+    blocking.set_ip_filter([localhost..=localhost]);
+    let _out = blocking
+        .add_torrent(
+            crate::AddTorrent::from_bytes(seeder.bytes.clone()),
+            Some(crate::AddTorrentOptions {
+                initial_peers: Some(vec![seeder.addr]),
+                disable_trackers: true,
+                ..Default::default()
+            }),
+        )
+        .await?;
+    let out = poll("a blocked outgoing connection", Duration::from_secs(20), || {
+        let list = blocking.take_blocked_peers();
+        (!list.is_empty()).then_some(list)
+    })
+    .await?;
+    assert_eq!((out[0].addr, out[0].kind), (seeder.addr, crate::BlockedPeerKind::Outgoing));
+    blocking.stop().await;
 
     // Cleared: a new leecher gets in (the old one would only retry after its growing backoff).
     session.stop().await;

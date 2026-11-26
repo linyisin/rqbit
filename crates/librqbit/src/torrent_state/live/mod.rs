@@ -29,6 +29,8 @@
 //   - 2026-11-22: connection limits per torrent and for the session that can change while running
 //     (crate::connection_limit, Session::set_connection_limits).
 //   - 2026-11-22: disconnect_peers (a new IP filter, Session::set_ip_filter).
+//   - 2026-11-26: blocked outgoing peers and disconnected ones are reported to the session
+//     (Session::take_blocked_peers).
 //   - 2026-11-24: the session's rate limits can skip uTP and local network peers
 //     (Session::set_rate_limit_scope, libtorrent's peer classes); torrent limits still apply.
 //   - 2026-11-22: super seeding (BEP 16, libtorrent's non-strict mode): set_super_seeding; peers
@@ -736,6 +738,7 @@ impl TorrentStateLive {
                     .blocked_outgoing
                     .fetch_add(1, Ordering::Relaxed);
                 debug!(?addr, "blocked outgoing connection (by the blacklist)");
+                session.note_blocked_peer(addr, crate::session::BlockedPeerKind::Outgoing);
                 continue;
             }
 
@@ -1030,17 +1033,17 @@ impl TorrentStateLive {
 
     /// qbt-rs: disconnects the live peers whose IP matches `blocked` (a new IP filter). Returns how
     /// many.
-    pub(crate) fn disconnect_peers(&self, blocked: impl Fn(IpAddr) -> bool) -> usize {
-        let mut count = 0;
+    pub(crate) fn disconnect_peers(&self, blocked: impl Fn(IpAddr) -> bool) -> Vec<SocketAddr> {
+        let mut disconnected = Vec::new();
         for e in self.peers.states.iter() {
             if let Some(live) = e.value().get_live()
                 && blocked(e.key().ip().to_canonical())
                 && live.tx.send(WriterRequest::Disconnect(Ok(()))).is_ok()
             {
-                count += 1;
+                disconnected.push(*e.key());
             }
         }
-        count
+        disconnected
     }
 
     /// qbt-rs: whether the session-wide rate limits apply to this peer (qBittorrent's "Apply rate
