@@ -32,6 +32,8 @@
 //     applied after a magnet link's metadata arrives too.
 //   - 2026-11-26: take_blocked_peers(): peers the IP filter kept out or disconnected (for
 //     qBittorrent's "Blocked IPs" log, libtorrent's peer_blocked_alert).
+//   - 2026-11-26: set_trackers() / reannounce_trackers(): change a torrent's trackers while
+//     running and reannounce to some of them (qBittorrent's tracker list menu).
 // Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
 
 use std::{
@@ -1736,7 +1738,7 @@ impl Session {
                 id,
                 span,
                 info_hash,
-                trackers: trackers.into_iter().collect(),
+                trackers: parking_lot::RwLock::new(trackers.into_iter().collect()),
                 web_seeds: crate::web_seed::WebSeeds::new(web_seeds),
                 tracker_statuses: tracker_statuses.clone(),
                 spawner: self.spawner.clone(),
@@ -1921,7 +1923,7 @@ impl Session {
         let is_private = t.with_metadata(|m| m.info.info().private).unwrap_or(false);
         self.make_peer_rx(
             t.info_hash(),
-            t.shared().trackers.iter().cloned().collect(),
+            t.shared().trackers.read().iter().cloned().collect(),
             announce,
             t.shared().options.force_tracker_interval,
             t.shared().options.initial_peers.clone(),
@@ -2060,6 +2062,79 @@ impl Session {
     /// (min) interval (libtorrent `force_reannounce(0, -1, ignore_min_interval)`), and, for
     /// public torrents, one more DHT lookup (`force_dht_announce`) whose peers are added for a
     /// minute. Only does anything while the torrent is running.
+    /// qbt-rs: replace a torrent's trackers (qBittorrent's "Add trackers", "Edit tracker URL",
+    /// "Remove tracker"). Removed trackers stop before their next announce; added ones start
+    /// announcing right away when the torrent is running (also when it had no trackers before).
+    pub fn set_trackers(self: &Arc<Self>, handle: &ManagedTorrentHandle, urls: impl IntoIterator<Item = url::Url>) {
+        let statuses = handle.shared().tracker_statuses.clone();
+        let new: HashSet<url::Url> = urls.into_iter().collect();
+        let (added, removed) = {
+            let mut current = handle.shared().trackers.write();
+            let added: Vec<url::Url> = new.difference(&current).cloned().collect();
+            let removed: Vec<url::Url> = current.difference(&new).cloned().collect();
+            *current = new;
+            (added, removed)
+        };
+        for url in &removed {
+            statuses.remove(url);
+        }
+        if added.is_empty() {
+            return;
+        }
+        if self.disable_trackers {
+            for url in &added {
+                statuses.register(url);
+            }
+            return;
+        }
+        // A running tracker stream picks them up; otherwise (no stream, or stopped) start one.
+        let not_taken: Vec<url::Url> = added.into_iter().filter(|url| !statuses.add(url.clone())).collect();
+        if not_taken.is_empty() {
+            return;
+        }
+        let Some(live) = handle.live() else {
+            return; // they are in the list and start with the torrent
+        };
+        let is_private = handle.with_metadata(|m| m.info.info().private).unwrap_or(false);
+        let Some(mut stream) = TrackerComms::start(
+            handle.info_hash(),
+            self.peer_id,
+            not_taken.into_iter().collect(),
+            Box::new(PeerRxTorrentInfo { info_hash: handle.info_hash(), session: self.clone() }),
+            handle.shared().options.force_tracker_interval,
+            self.announce_port().unwrap_or(4240),
+            if self.anonymous_mode && !is_private { self.anonymous_reqwest_client.clone() } else { self.reqwest_client.clone() },
+            self.udp_tracker_client.clone(),
+            statuses,
+        ) else {
+            return;
+        };
+        let sources = handle.shared().peer_sources.clone();
+        let live = Arc::downgrade(&live);
+        self.spawn(
+            debug_span!(parent: handle.shared().span.clone(), "added_trackers"),
+            "added_trackers",
+            async move {
+                // Feed the peers into the running torrent; stop when it stops.
+                while let Some(addr) = stream.next().await {
+                    sources.mark(addr, crate::peer_source::FROM_TRACKER);
+                    let Some(live) = live.upgrade() else { break };
+                    if live.add_peer_if_not_seen(addr).is_err() {
+                        break;
+                    }
+                }
+                Ok(())
+            },
+        );
+    }
+
+    /// qbt-rs: reannounce to these trackers only (qBittorrent's "Force reannounce to selected").
+    pub fn reannounce_trackers(&self, handle: &ManagedTorrentHandle, urls: &[url::Url]) {
+        if handle.live().is_some() {
+            handle.shared().tracker_statuses.reannounce_some(urls);
+        }
+    }
+
     pub fn reannounce(self: &Arc<Self>, handle: &ManagedTorrentHandle) {
         let Some(live) = handle.live() else {
             return;

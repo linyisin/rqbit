@@ -41,7 +41,7 @@ async fn trackers_after_add(private: bool) -> anyhow::Result<Vec<String>> {
         .await?
         .into_handle()
         .context("handle")?;
-    let mut trackers: Vec<String> = handle.shared().trackers.iter().map(|u| u.to_string()).collect();
+    let mut trackers: Vec<String> = handle.shared().trackers.read().iter().map(|u| u.to_string()).collect();
     trackers.sort();
     session.stop().await;
     Ok(trackers)

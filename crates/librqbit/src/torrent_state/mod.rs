@@ -16,6 +16,8 @@
 //   - 2026-11-22: add_web_seed() / remove_web_seed().
 //   - 2026-11-22: handshake_info_hashes() (hybrid torrents also answer to the v2 hash).
 //   - 2026-11-26: connect_peer() (qBittorrent's "Add peers...", libtorrent's connect_peer).
+//   - 2026-11-26: the tracker list can change while running (ManagedTorrentShared::trackers is
+//     behind a lock; trackers(); see Session::set_trackers).
 // Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
 
 pub mod initializing;
@@ -235,7 +237,8 @@ pub struct ManagedTorrentShared {
     /// qbt-rs: status of each tracker (announce results, scrape counts).
     pub tracker_statuses: tracker_comms::TrackerStatuses,
     pub(crate) spawner: BlockingSpawner,
-    pub trackers: HashSet<url::Url>,
+    /// qbt-rs: behind a lock, the list can change (Session::set_trackers).
+    pub trackers: parking_lot::RwLock<HashSet<url::Url>>,
     /// qbt-rs: HTTP web seeds (BEP 19 "url-list") and what they are doing.
     pub web_seeds: crate::web_seed::WebSeeds,
     pub peer_id: Id20,
@@ -454,6 +457,13 @@ impl ManagedTorrent {
     pub fn connect_peer(&self, addr: SocketAddr) -> anyhow::Result<bool> {
         let live = self.live().context("the torrent isn't running")?;
         Ok(live.add_peer_if_not_seen(addr)?)
+    }
+
+    /// qbt-rs: the torrent's trackers, sorted.
+    pub fn trackers(&self) -> Vec<url::Url> {
+        let mut v: Vec<url::Url> = self.shared.trackers.read().iter().cloned().collect();
+        v.sort();
+        v
     }
 
     pub fn live(&self) -> Option<Arc<TorrentStateLive>> {

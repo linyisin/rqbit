@@ -3,9 +3,12 @@
 // rqbit.
 // 2026-11-22: TrackerStatuses also carries the "reannounce now" signal (qBittorrent's
 // "Force reannounce", libtorrent force_reannounce with ignore_min_interval).
+// 2026-11-26: trackers can be added and removed while running (qBittorrent's "Add trackers",
+// "Edit tracker URL", "Remove tracker"), and a reannounce can target some trackers only
+// ("Force reannounce to selected").
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -62,6 +65,24 @@ pub struct TrackerStatuses {
     map: Arc<RwLock<HashMap<String, TrackerStatus>>>,
     /// Bumped by [`TrackerStatuses::reannounce`]; tracker monitors wait on it while sleeping.
     reannounce: Arc<tokio::sync::watch::Sender<u64>>,
+    /// qbt-rs: which trackers the last reannounce was for (`None` = all).
+    reannounce_targets: Arc<RwLock<Option<HashSet<String>>>>,
+    /// qbt-rs: trackers added or removed while running.
+    changes: Arc<parking_lot::Mutex<TrackerChanges>>,
+    /// qbt-rs: wakes the running TrackerComms when trackers were added.
+    added_signal: Arc<tokio::sync::Notify>,
+}
+
+#[derive(Default)]
+struct TrackerChanges {
+    /// Waiting for the running TrackerComms to start them.
+    added: Vec<Url>,
+    /// Their monitors stop before their next announce.
+    removed: HashSet<String>,
+    /// Trackers with a running monitor.
+    active: HashSet<String>,
+    /// Running TrackerComms streams.
+    streams: usize,
 }
 
 impl Default for TrackerStatuses {
@@ -69,6 +90,28 @@ impl Default for TrackerStatuses {
         Self {
             map: Default::default(),
             reannounce: Arc::new(tokio::sync::watch::channel(0).0),
+            reannounce_targets: Default::default(),
+            changes: Default::default(),
+            added_signal: Default::default(),
+        }
+    }
+}
+
+/// qbt-rs: keeps [`TrackerStatuses`] informed about a running monitor or stream; undone on drop
+/// (the torrent stopped and dropped its tracker stream).
+pub(crate) struct RunningGuard {
+    statuses: TrackerStatuses,
+    tracker: Option<String>,
+}
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        let mut c = self.statuses.changes.lock();
+        match &self.tracker {
+            Some(url) => {
+                c.active.remove(url);
+            }
+            None => c.streams = c.streams.saturating_sub(1),
         }
     }
 }
@@ -82,7 +125,90 @@ impl std::fmt::Debug for TrackerStatuses {
 impl TrackerStatuses {
     /// Ask every tracker to announce now, ignoring the tracker's (min) interval.
     pub fn reannounce(&self) {
+        *self.reannounce_targets.write() = None;
         self.reannounce.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// qbt-rs: like [`reannounce`](Self::reannounce), for these trackers only.
+    pub fn reannounce_some(&self, urls: &[Url]) {
+        *self.reannounce_targets.write() = Some(urls.iter().map(|u| u.to_string()).collect());
+        self.reannounce.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// qbt-rs: whether the last reannounce (or a removal) concerns this tracker.
+    pub(crate) fn reannounce_applies(&self, url: &Url) -> bool {
+        self.is_removed(url) || self.reannounce_targets.read().as_ref().is_none_or(|t| t.contains(url.as_str()))
+    }
+
+    /// qbt-rs: add a tracker while running. A running TrackerComms starts announcing to it
+    /// right away; returns false when there is none (the caller has to start one).
+    pub fn add(&self, url: Url) -> bool {
+        self.register(&url);
+        let mut c = self.changes.lock();
+        c.removed.remove(url.as_str());
+        if c.active.contains(url.as_str()) {
+            return true; // its monitor is still running (it was removed and added back)
+        }
+        if c.streams == 0 {
+            return false;
+        }
+        c.added.push(url);
+        drop(c);
+        self.added_signal.notify_one();
+        true
+    }
+
+    /// qbt-rs: remove a tracker while running: it disappears from the list and its monitor stops
+    /// before its next announce.
+    pub fn remove(&self, url: &Url) {
+        self.map.write().remove(url.as_str());
+        let mut c = self.changes.lock();
+        c.added.retain(|u| u != url);
+        c.removed.insert(url.to_string());
+        drop(c);
+        // Wake sleeping monitors so the removed one stops now.
+        self.reannounce.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    pub(crate) fn is_removed(&self, url: &Url) -> bool {
+        self.changes.lock().removed.contains(url.as_str())
+    }
+
+    /// qbt-rs: a monitor calls this before each announce; true means it was removed and must
+    /// stop (it is no longer active).
+    pub(crate) fn leave_if_removed(&self, url: &Url) -> bool {
+        let mut c = self.changes.lock();
+        if c.removed.remove(url.as_str()) {
+            c.active.remove(url.as_str());
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn take_added(&self) -> Vec<Url> {
+        std::mem::take(&mut self.changes.lock().added)
+    }
+
+    pub(crate) fn added_signal(&self) -> Arc<tokio::sync::Notify> {
+        self.added_signal.clone()
+    }
+
+    /// qbt-rs: a monitor for this tracker started (`None`: a TrackerComms stream started).
+    pub(crate) fn running(&self, tracker: Option<&Url>) -> RunningGuard {
+        let mut c = self.changes.lock();
+        match tracker {
+            Some(url) => {
+                c.active.insert(url.to_string());
+                c.removed.remove(url.as_str());
+            }
+            None => c.streams += 1,
+        }
+        RunningGuard { statuses: self.clone(), tracker: tracker.map(|u| u.to_string()) }
+    }
+
+    /// qbt-rs: number of running TrackerComms streams for this torrent.
+    pub fn running_streams(&self) -> usize {
+        self.changes.lock().streams
     }
 
     /// A receiver that sees the next [`TrackerStatuses::reannounce`] call.
@@ -107,6 +233,10 @@ impl TrackerStatuses {
     }
 
     pub fn update(&self, url: &Url, f: impl FnOnce(&mut TrackerStatus)) {
+        // qbt-rs: an announce that was in flight when the tracker got removed doesn't bring it back.
+        if self.is_removed(url) {
+            return;
+        }
         f(self.map.write().entry(url.to_string()).or_default());
     }
 }

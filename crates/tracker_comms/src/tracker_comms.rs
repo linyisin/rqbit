@@ -6,6 +6,9 @@
 //   - 2026-11-22: HTTP announces and scrapes give up after 30 seconds (libtorrent's
 //     tracker_completion_timeout); the shared HTTP client has no timeout, so an unreachable
 //     tracker used to stay "updating" until the OS gave up on the connection.
+//   - 2026-11-26: trackers added while running (TrackerStatuses::add) start announcing right
+//     away, removed ones stop before their next announce; a reannounce can target some trackers
+//     only. The stream keeps running while it has no trackers left (more can be added).
 // Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
 
 use std::collections::HashSet;
@@ -144,6 +147,19 @@ enum SupportedTracker {
     Http(Url),
 }
 
+impl SupportedTracker {
+    fn from_url(url: Url) -> Option<Self> {
+        match url.scheme() {
+            "http" | "https" => Some(SupportedTracker::Http(url)),
+            "udp" => Some(SupportedTracker::Udp(url)),
+            _ => {
+                debug!("unsupported tracker URL: {}", url);
+                None
+            }
+        }
+    }
+}
+
 impl std::fmt::Debug for SupportedTracker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -212,17 +228,7 @@ impl TrackerComms {
         for t in &trackers {
             statuses.register(t);
         }
-        let trackers = trackers
-            .into_iter()
-            .filter_map(|t| match t.scheme() {
-                "http" | "https" => Some(SupportedTracker::Http(t)),
-                "udp" => Some(SupportedTracker::Udp(t)),
-                _ => {
-                    debug!("unsupported tracker URL: {}", t);
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
+        let trackers = trackers.into_iter().filter_map(SupportedTracker::from_url).collect::<Vec<_>>();
         if trackers.is_empty() {
             debug!(?info_hash, "trackers list is empty");
             return None;
@@ -234,6 +240,9 @@ impl TrackerComms {
 
         let s = async_stream::stream! {
             use futures::StreamExt;
+            // qbt-rs: lets TrackerStatuses::add know trackers can be added to this stream.
+            let _running = statuses.running(None);
+            let added_signal = statuses.added_signal();
             let comms = Arc::new(Self {
                 info_hash,
                 peer_id,
@@ -249,7 +258,8 @@ impl TrackerComms {
             for tracker in trackers {
                 futures.push(comms.add_tracker(tracker, &udp_client))
             }
-            while !(futures.is_empty()) {
+            // qbt-rs: runs until dropped (the torrent stops); trackers can be added meanwhile.
+            loop {
                 tokio::select! {
                     addr = rx.recv() => {
                         if let Some(addr) = addr {
@@ -259,6 +269,13 @@ impl TrackerComms {
                     e = futures.next(), if !futures.is_empty() => {
                         if let Some(Err(e)) = e {
                             debug!("error: {e}");
+                        }
+                    }
+                    _ = added_signal.notified() => {
+                        for url in comms.statuses.take_added() {
+                            if let Some(t) = SupportedTracker::from_url(url) {
+                                futures.push(comms.add_tracker(t, &udp_client));
+                            }
                         }
                     }
                 }
@@ -298,11 +315,28 @@ impl TrackerComms {
         }
     }
 
+    /// qbt-rs: wait for a reannounce meant for this tracker (or its removal).
+    async fn wait_reannounce(&self, url: &Url, rx: &mut tokio::sync::watch::Receiver<u64>) {
+        loop {
+            if rx.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+            if self.statuses.reannounce_applies(url) {
+                return;
+            }
+        }
+    }
+
     async fn task_single_tracker_monitor_http(&self, tracker_url: Url) -> anyhow::Result<()> {
         trace!(url=%tracker_url, "starting monitor");
+        let _running = self.statuses.running(Some(&tracker_url));
         let mut event = Some(tracker_comms_http::TrackerRequestEvent::Started);
 
         loop {
+            // qbt-rs: removed while running.
+            if self.statuses.leave_if_removed(&tracker_url) {
+                return Ok(());
+            }
             let mut reannounce = self.statuses.reannounce_signal();
             let request = (|| self.tracker_one_request_http(&tracker_url, event))
                 .retry(
@@ -323,7 +357,7 @@ impl TrackerComms {
             let interval = tokio::select! {
                 r = request => r.context("this shouldn't fail")?,
                 // qbt-rs: forced reannounce while backing off after errors: try again now.
-                _ = reannounce.changed() => continue,
+                _ = self.wait_reannounce(&tracker_url, &mut reannounce) => continue,
             };
 
             event = None;
@@ -335,7 +369,7 @@ impl TrackerComms {
             debug!("sleeping for {:?} after calling tracker", interval);
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {}
-                _ = reannounce.changed() => debug!("forced reannounce"),
+                _ = self.wait_reannounce(&tracker_url, &mut reannounce) => debug!("forced reannounce"),
             }
         }
     }
@@ -481,15 +515,20 @@ impl TrackerComms {
         let mut sleep_interval: Option<Duration> = None;
         let mut prev_addrs: Option<UdpTrackerResolveResult> = None;
         let mut reannounce = self.statuses.reannounce_signal();
+        let _running = self.statuses.running(Some(&url));
         loop {
             if let Some(i) = sleep_interval {
                 trace!(interval=?sleep_interval, "sleeping");
                 tokio::select! {
                     _ = tokio::time::sleep(i) => {}
-                    _ = reannounce.changed() => debug!("forced reannounce"),
+                    _ = self.wait_reannounce(&url, &mut reannounce) => debug!("forced reannounce"),
                 }
             }
             reannounce.mark_unchanged();
+            // qbt-rs: removed while running.
+            if self.statuses.leave_if_removed(&url) {
+                return Ok(());
+            }
 
             // This should retry forever until the addrs are resolved.
             let addrs = (async || {
