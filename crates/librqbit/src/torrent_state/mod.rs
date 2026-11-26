@@ -18,6 +18,7 @@
 //   - 2026-11-26: connect_peer() (qBittorrent's "Add peers...", libtorrent's connect_peer).
 //   - 2026-11-26: the tracker list can change while running (ManagedTorrentShared::trackers is
 //     behind a lock; trackers(); see Session::set_trackers).
+//   - 2026-11-27: content_root(); save_path() works with any content layout.
 // Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
 
 pub mod initializing;
@@ -313,17 +314,27 @@ impl ManagedTorrent {
         self.shared.options.output_folder.read().clone()
     }
 
-    /// qbt-rs: the "save path" in qBittorrent terms: the output folder without the default
-    /// per-torrent subfolder that multi-file torrents get (see `default_subfolder_for_torrent`).
+    /// qbt-rs: the torrent's own folder under the save path, if it has one: the torrent's name for
+    /// multi-file torrents, the file name without extension for single-file ones put in a folder
+    /// (`ContentLayout::Subfolder`). Worked out from the output folder, so it is right after a
+    /// restart too; `None` when the files are right in the save path.
+    pub fn content_root(&self) -> Option<PathBuf> {
+        let output = self.output_folder();
+        let metadata = self.metadata.load();
+        let m = metadata.as_ref()?;
+        let candidate = crate::session::default_subfolder_for_torrent(&m.info, self.shared.magnet_name.as_deref())
+            .ok()
+            .flatten()
+            .or_else(|| crate::session::single_file_root(&m.info))?;
+        output.ends_with(&candidate).then_some(candidate)
+    }
+
+    /// qbt-rs: the "save path" in qBittorrent terms: the output folder without the torrent's own
+    /// folder (see `content_root`).
     pub fn save_path(&self) -> PathBuf {
         let output = self.output_folder();
-        let subfolder = self.metadata.load().as_ref().and_then(|m| {
-            crate::session::default_subfolder_for_torrent(&m.info, self.shared.magnet_name.as_deref())
-                .ok()
-                .flatten()
-        });
-        match subfolder {
-            Some(sub) if output.ends_with(&sub) => output
+        match self.content_root() {
+            Some(sub) => output
                 .ancestors()
                 .nth(sub.components().count())
                 .map(Path::to_path_buf)

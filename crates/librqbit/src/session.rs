@@ -34,6 +34,9 @@
 //     qBittorrent's "Blocked IPs" log, libtorrent's peer_blocked_alert).
 //   - 2026-11-26: set_trackers() / reannounce_trackers(): change a torrent's trackers while
 //     running and reannounce to some of them (qBittorrent's tracker list menu).
+//   - 2026-11-27: AddTorrentOptions::content_layout (qBittorrent's torrent content layout);
+//     move_storage() keeps the torrent's own folder whatever the layout (content_root); the old
+//     get_default_subfolder_for_torrent() helper went away (content_root_for_layout replaces it).
 // Licensed under Apache-2.0 like the rest of rqbit; this notice satisfies section 4(b).
 
 use std::{
@@ -359,6 +362,47 @@ fn merge_two_optional_streams<T>(
     }
 }
 
+/// qbt-rs: qBittorrent's "torrent content layout": whether the files go into a folder of their
+/// own under the save path.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContentLayout {
+    /// As the torrent has it: multi-file torrents get a folder named after the torrent.
+    #[default]
+    Original,
+    /// Always a folder: single-file torrents get one named after the file without its extension.
+    Subfolder,
+    /// Never a folder: a multi-file torrent's files go right into the save path.
+    NoSubfolder,
+}
+
+/// qbt-rs: the folder a single-file torrent gets with `ContentLayout::Subfolder` (qBittorrent
+/// `Path::addRootFolder(filePaths, filePaths.at(0).removedExtension())`).
+pub(crate) fn single_file_root<B: AsRef<[u8]>>(info: &ValidatedTorrentMetaV1Info<B>) -> Option<PathBuf> {
+    let mut files = info.iter_file_details().filter(|fd| !fd.attrs().padding);
+    let first = files.next()?;
+    if files.next().is_some() {
+        return None;
+    }
+    let path = first.filename.to_pathbuf();
+    let stem = path.file_stem()?.to_owned();
+    let root = PathBuf::from(stem);
+    root.components().all(|c| matches!(c, Component::Normal(_))).then_some(root)
+}
+
+/// qbt-rs: the folder the files go into under the save path for this layout.
+pub(crate) fn content_root_for_layout(
+    info: &ValidatedTorrentMetaV1Info<ByteBufOwned>,
+    magnet_name: Option<&str>,
+    layout: ContentLayout,
+) -> anyhow::Result<Option<PathBuf>> {
+    let original = default_subfolder_for_torrent(info, magnet_name)?;
+    Ok(match layout {
+        ContentLayout::Original => original,
+        ContentLayout::NoSubfolder => None,
+        ContentLayout::Subfolder => original.or_else(|| single_file_root(info)),
+    })
+}
+
 /// qbt-rs: a peer the IP filter kept out (see Session::take_blocked_peers).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlockedPeer {
@@ -430,6 +474,10 @@ pub struct AddTorrentOptions {
 
     // Custom trackers
     pub trackers: Option<Vec<String>>,
+
+    /// qbt-rs: whether the files get a folder of their own (qBittorrent's content layout).
+    #[serde(default)]
+    pub content_layout: ContentLayout,
 
     /// qbt-rs: files not to download when neither `only_files` nor `only_files_regex` is set.
     #[serde(default)]
@@ -1581,14 +1629,6 @@ impl Session {
         .boxed()
     }
 
-    fn get_default_subfolder_for_torrent(
-        &self,
-        info: &ValidatedTorrentMetaV1Info<ByteBufOwned>,
-        magnet_name: Option<&str>,
-    ) -> anyhow::Result<Option<PathBuf>> {
-        default_subfolder_for_torrent(info, magnet_name)
-    }
-
     async fn add_torrent_internal(
         self: &Arc<Self>,
         add_res: InternalAddResult,
@@ -1674,10 +1714,12 @@ impl Session {
             .map(PathBuf::from)
             .unwrap_or_else(|| self.output_folder.clone());
         let output_folder = match (opts.output_folder, opts.sub_folder) {
-            (None, None) => save_root.join(
-                self.get_default_subfolder_for_torrent(&metadata.info, name.as_deref())?
-                    .unwrap_or_default(),
-            ),
+            // qbt-rs: no folder of its own means the save path itself (joining an empty path would
+            // leave a trailing slash).
+            (None, None) => match content_root_for_layout(&metadata.info, name.as_deref(), opts.content_layout)? {
+                Some(root) => save_root.join(root),
+                None => save_root,
+            },
             (Some(o), None) => PathBuf::from(o),
             (Some(_), Some(_)) => {
                 bail!("you can't provide both output_folder and sub_folder")
@@ -2178,8 +2220,8 @@ impl Session {
             .metadata
             .load_full()
             .context("cannot move a torrent without metadata")?;
-        let subfolder =
-            default_subfolder_for_torrent(&metadata.info, handle.shared.magnet_name.as_deref())?;
+        // qbt-rs: the torrent's own folder as it is on disk (any content layout).
+        let subfolder = handle.content_root();
         let old_folder = handle.output_folder();
         let new_folder = match &subfolder {
             Some(sub) => new_save_path.join(sub),
