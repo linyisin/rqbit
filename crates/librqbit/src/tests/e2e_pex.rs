@@ -1,5 +1,5 @@
 // Added by qbt-rs (https://github.com/linyisin/qbt-rs), 2026-11-22: end-to-end test for turning
-// peer exchange off (SessionOptions::disable_pex). Licensed under Apache-2.0 like the rest of rqbit.
+// peer exchange off (SessionOptions::disable_pex; 2026-11-27: also for one torrent). Licensed under Apache-2.0 like the rest of rqbit.
 
 use std::{net::Ipv4Addr, num::NonZeroU32, time::Duration};
 
@@ -24,7 +24,7 @@ fn listening() -> Option<ListenerOptions> {
 
 /// The seeder connects to leecher A; leecher B only knows the seeder. Returns whether B learned
 /// A's address (from the seeder's PEX) within `wait`.
-async fn b_learns_a(b_disable_pex: bool, wait: Duration) -> anyhow::Result<bool> {
+async fn b_learns_a(b_disable_pex: bool, b_torrent_pex_off: bool, wait: Duration) -> anyhow::Result<bool> {
     setup_test_logging();
     let seed_dir = tempfile::TempDir::with_prefix("rqbit_pex_seed").unwrap();
     let file = seed_dir.path().join("data.bin");
@@ -91,6 +91,10 @@ async fn b_learns_a(b_disable_pex: bool, wait: Duration) -> anyhow::Result<bool>
         .await?
         .into_handle()
         .context("handle")?;
+    if b_torrent_pex_off {
+        // qbt-rs: PeX off for this torrent only (the session keeps it on).
+        b.set_peer_discovery(&b_handle, true, false, true);
+    }
 
     let deadline = tokio::time::Instant::now() + wait;
     let mut learned = false;
@@ -110,12 +114,18 @@ async fn b_learns_a(b_disable_pex: bool, wait: Duration) -> anyhow::Result<bool>
 #[tokio::test(flavor = "multi_thread")]
 async fn test_pex_shares_peers() -> anyhow::Result<()> {
     // The first PEX message goes out about 10 s after connecting.
-    assert!(b_learns_a(false, Duration::from_secs(40)).await?, "B should learn A through PEX");
+    assert!(b_learns_a(false, false, Duration::from_secs(40)).await?, "B should learn A through PEX");
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_disable_pex() -> anyhow::Result<()> {
-    assert!(!b_learns_a(true, Duration::from_secs(20)).await?, "with PEX off, B must not learn A");
+    assert!(!b_learns_a(true, false, Duration::from_secs(20)).await?, "with PEX off, B must not learn A");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_disable_pex_for_one_torrent() -> anyhow::Result<()> {
+    assert!(!b_learns_a(false, true, Duration::from_secs(20)).await?, "with PEX off for B's torrent, B must not learn A");
     Ok(())
 }

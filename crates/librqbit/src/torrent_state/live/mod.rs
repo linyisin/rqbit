@@ -29,6 +29,7 @@
 //   - 2026-11-22: connection limits per torrent and for the session that can change while running
 //     (crate::connection_limit, Session::set_connection_limits).
 //   - 2026-11-22: disconnect_peers (a new IP filter, Session::set_ip_filter).
+//   - 2026-11-27: peer exchange can also be turned off for one torrent (PeerSources).
 //   - 2026-11-26: blocked outgoing peers and disconnected ones are reported to the session
 //     (Session::take_blocked_peers).
 //   - 2026-11-24: the session's rate limits can skip uTP and local network peers
@@ -1064,9 +1065,10 @@ impl TorrentStateLive {
         self.peer_limit.set(limit);
     }
 
-    /// qbt-rs: peer exchange isn't turned off for the session.
+    /// qbt-rs: peer exchange isn't turned off for the session, nor for this torrent.
     pub(crate) fn pex_enabled_for_session(&self) -> bool {
         self.shared.session.upgrade().is_none_or(|s| !s.disable_pex)
+            && !self.shared.peer_sources.is_disabled(crate::peer_source::FROM_PEX)
     }
 
     /// qbt-rs: super seeding is on and we are a seed (libtorrent turns it off otherwise).

@@ -100,7 +100,15 @@ async fn content_layout() -> anyhow::Result<()> {
             .await?
             .into_handle()
             .context("handle")?;
-        wait_until(|| handle.with_metadata(|_| ()).map(|_| ()).context("metadata"), Duration::from_secs(10)).await?;
+        // Moving is refused while the first check runs (slow when the whole suite runs at once).
+        wait_until(
+            || match handle.stats().state {
+                crate::TorrentStatsState::Paused | crate::TorrentStatsState::Live => Ok(()),
+                s => anyhow::bail!("still {s:?}"),
+            },
+            Duration::from_secs(20),
+        )
+        .await?;
         session.move_storage(&handle, target.clone()).await?;
         assert_eq!(handle.save_path(), target);
         assert!(target.join(file).exists(), "{layout:?}: {file} under the new save path");

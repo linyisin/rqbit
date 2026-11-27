@@ -34,6 +34,8 @@
 //     qBittorrent's "Blocked IPs" log, libtorrent's peer_blocked_alert).
 //   - 2026-11-26: set_trackers() / reannounce_trackers(): change a torrent's trackers while
 //     running and reannounce to some of them (qBittorrent's tracker list menu).
+//   - 2026-11-27: set_peer_discovery(): DHT, PeX and LSD can be turned off for one torrent
+//     (qBittorrent's torrent options), also while it runs.
 //   - 2026-11-27: AddTorrentOptions::content_layout (qBittorrent's torrent content layout);
 //     move_storage() keeps the torrent's own folder whatever the layout (content_root); the old
 //     get_default_subfolder_for_torrent() helper went away (content_root_for_layout replaces it).
@@ -1994,20 +1996,28 @@ impl Session {
             let sources = sources.clone();
             move |addr: &SocketAddr| sources.mark(*addr, source)
         };
-        let dht_rx = if is_private {
+        // qbt-rs: a source turned off for this torrent isn't started, and one turned off later
+        // ends at its next peer (set_peer_discovery).
+        let still_on = |source: u8| {
+            let sources = sources.clone();
+            move |_: &SocketAddr| futures::future::ready(!sources.is_disabled(source))
+        };
+        let dht_rx = if is_private || sources.is_disabled(FROM_DHT) {
             None
         } else {
             self.dht.as_ref().map(|dht| {
                 dht.get_peers(info_hash, if announce { self.announce_port } else { None })
+                    .take_while(still_on(FROM_DHT))
                     .inspect(tag(FROM_DHT))
             })
         };
 
-        let lsd_rx = if is_private {
+        let lsd_rx = if is_private || sources.is_disabled(FROM_LSD) {
             None
         } else {
             self.lsd.as_ref().map(|lsd| {
                 lsd.announce(info_hash, if announce { self.announce_port } else { None })
+                    .take_while(still_on(FROM_LSD))
                     .inspect(tag(FROM_LSD))
             })
         };
@@ -2138,7 +2148,7 @@ impl Session {
             return; // they are in the list and start with the torrent
         };
         let is_private = handle.with_metadata(|m| m.info.info().private).unwrap_or(false);
-        let Some(mut stream) = TrackerComms::start(
+        let Some(stream) = TrackerComms::start(
             handle.info_hash(),
             self.peer_id,
             not_taken.into_iter().collect(),
@@ -2151,23 +2161,66 @@ impl Session {
         ) else {
             return;
         };
+        // Feed the peers into the running torrent; stop when it stops.
+        self.feed_live(handle, &live, stream, crate::peer_source::FROM_TRACKER, "added_trackers");
+    }
+
+    /// qbt-rs: turn DHT, PeX and LSD on or off for one torrent (qBittorrent's "Disable DHT / PeX /
+    /// LSD for this torrent"). Turning one off stops using it (a running DHT or LSD lookup ends at
+    /// its next peer); turning DHT or LSD back on while the torrent runs starts a new lookup.
+    /// Private torrents never use them.
+    pub fn set_peer_discovery(self: &Arc<Self>, handle: &ManagedTorrentHandle, dht: bool, pex: bool, lsd: bool) {
+        use crate::peer_source::{FROM_DHT, FROM_LSD, FROM_PEX};
         let sources = handle.shared().peer_sources.clone();
-        let live = Arc::downgrade(&live);
-        self.spawn(
-            debug_span!(parent: handle.shared().span.clone(), "added_trackers"),
-            "added_trackers",
-            async move {
-                // Feed the peers into the running torrent; stop when it stops.
-                while let Some(addr) = stream.next().await {
-                    sources.mark(addr, crate::peer_source::FROM_TRACKER);
-                    let Some(live) = live.upgrade() else { break };
-                    if live.add_peer_if_not_seen(addr).is_err() {
-                        break;
-                    }
+        let before = sources.disabled();
+        let off = |on: bool, bit: u8| if on { 0 } else { bit };
+        sources.set_disabled(off(dht, FROM_DHT) | off(pex, FROM_PEX) | off(lsd, FROM_LSD));
+        let is_private = handle.with_metadata(|m| m.info.info().private).unwrap_or(true);
+        let Some(live) = handle.live().filter(|_| !is_private) else {
+            return;
+        };
+        let info_hash = handle.info_hash();
+        let still_on = |source: u8| {
+            let sources = sources.clone();
+            move |_: &SocketAddr| futures::future::ready(!sources.is_disabled(source))
+        };
+        if dht
+            && before & FROM_DHT != 0
+            && let Some(d) = self.dht.as_ref()
+        {
+            let stream = d.get_peers(info_hash, self.announce_port).take_while(still_on(FROM_DHT)).boxed();
+            self.feed_live(handle, &live, stream, FROM_DHT, "dht_turned_on");
+        }
+        if lsd
+            && before & FROM_LSD != 0
+            && let Some(l) = self.lsd.as_ref()
+        {
+            let stream = l.announce(info_hash, self.announce_port).take_while(still_on(FROM_LSD)).boxed();
+            self.feed_live(handle, &live, stream, FROM_LSD, "lsd_turned_on");
+        }
+    }
+
+    /// qbt-rs: feed peers from a stream into a running torrent until either ends.
+    fn feed_live(
+        self: &Arc<Self>,
+        handle: &ManagedTorrentHandle,
+        live: &Arc<TorrentStateLive>,
+        mut stream: futures::stream::BoxStream<'static, SocketAddr>,
+        source: u8,
+        name: &'static str,
+    ) {
+        let sources = handle.shared().peer_sources.clone();
+        let live = Arc::downgrade(live);
+        self.spawn(debug_span!(parent: handle.shared().span.clone(), "feed_live", name), name, async move {
+            while let Some(addr) = stream.next().await {
+                sources.mark(addr, source);
+                let Some(live) = live.upgrade() else { break };
+                if live.add_peer_if_not_seen(addr).is_err() {
+                    break;
                 }
-                Ok(())
-            },
-        );
+            }
+            Ok(())
+        });
     }
 
     /// qbt-rs: reannounce to these trackers only (qBittorrent's "Force reannounce to selected").
